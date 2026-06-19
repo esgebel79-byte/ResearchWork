@@ -1,0 +1,37 @@
+# Конфигурация проекта covid-forecasting-mlops
+# Параметры путей, окна, горизонты и сетки для физической регуляризации
+
+data:
+  raw_path: "data/raw/cases.csv"    # исходный CSV (unique_id, ds, y, ...)
+  processed_dir: "data/processed"
+  date_col: "ds"
+  id_col: "unique_id"
+  targets:
+    - PCR_TESTS
+    - CONFIRMED.sk
+    - ACTIVE.sk
+    - OCCUPIED_BEDS_CALCULATED
+
+training:
+  horizon: 28          # прогнозный горизонт H (дней)
+  seq_len: 56          # длина входной последовательности
+  batch_size: 64
+  epochs: 50
+  lr: 0.001
+
+patchtst:
+  patch_size: 7        # размер патча для PatchTST/PR-Patch
+  n_patches: 8
+
+ews:
+  rolling_window: 14   # окно для скользящих индикаторов
+  ar_lag: 1            # лаг для AR(1)
+
+physics:
+  lambda_grid: [0.0, 0.01, 0.1, 1.0]   # варианты регуляризации для PCE
+
+artifacts:
+  base_dir: "artifacts"
+
+logging:
+  tensorboard_dir: "artifacts/logs/tensorboard"
