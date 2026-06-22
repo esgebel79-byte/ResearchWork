@@ -28,7 +28,7 @@ ews:
   ar_lag: 1            # лаг для AR(1)
 
 physics:
-  lambda_grid: [0.0, 0.01, 0.1, 1.0]   # варианты регуляризации для PCE
+  lambda_grid: [0.0, 0.01, 0.05, 0.1, 0.5, 1.0]   # варианты регуляризации для PCE
 
 artifacts:
   base_dir: "artifacts"
