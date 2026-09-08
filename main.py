@@ -40,7 +40,7 @@ from src.evaluation import (
     plot_shap_summary
 )
 from src.explainability import explain_shap_prpatch, explain_lime_instance
-from src.models.pr_patch import PRPatchModel
+from src.models.pr_patch import PRPatchModel, PhysicsRegularizedLoss
 # Попытка импорта реальной модели из вашей новой структуры папок
 try:
     from src.models.pr_patch import PRPatchModel
@@ -83,9 +83,14 @@ def dummy_model_trainer(lam: float, config: dict) -> torch.nn.Module:
     class EmulatedPatchModel(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            self.beta = torch.nn.Parameter(torch.tensor(0.25))
-            self.gamma = torch.nn.Parameter(torch.tensor(0.10))
+            self.physics_loss = PhysicsRegularizedLoss(lambda_base=0.05, alpha=0.5)
             self.dummy_param = torch.nn.Linear(1, 1)
+        @property
+        def beta(self):
+            return self.physics_loss.beta
+        @property
+        def gamma(self):
+            return self.physics_loss.gamma
         def forward(self, x, ews=None):
             batch_size = x.shape[0]
             horizon = config.get("horizon", 14)
@@ -316,10 +321,10 @@ if __name__ == "__main__":
     lambda_grid = config.get("physics", {}).get("lambda_grid", [0.0, 0.01, 0.05, 0.1, 0.5, 1.0])
     # Pass scaled dataframe to sensitivity analysis so models train on normalized data
     try:
-        df_sens = run_lambda_sensitivity_analysis(dummy_model_trainer, lambda_grid, df_scaled, config, horizon)
+        df_sens = run_lambda_sensitivity_analysis(dummy_model_trainer, lambda_grid, df_scaled, config, horizon, x_scaler=X_scaler)
     except Exception as e:
         logger.exception(f"Lambda sensitivity analysis failed on scaled data: {e}; retrying on raw data.")
-        df_sens = run_lambda_sensitivity_analysis(dummy_model_trainer, lambda_grid, df_data, config, horizon)
+        df_sens = run_lambda_sensitivity_analysis(dummy_model_trainer, lambda_grid, df_data, config, horizon, x_scaler=None)
 
     # 3. Интерпретация локальных патчей
     logger.info("Шаг 3: Поиск точек излома тренда и запуск SHAP/LIME интерпретации...")

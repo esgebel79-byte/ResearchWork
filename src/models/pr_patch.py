@@ -126,6 +126,7 @@ class PhysicsRegularizedLoss(nn.Module):
         super().__init__()
         self.lambda_base = float(lambda_base)
         self.alpha = float(alpha)
+        # Keep a strictly positive floor so the physical parameters do not collapse to 0.0
         self.raw_beta = nn.Parameter(torch.tensor(0.1))
         self.raw_gamma = nn.Parameter(torch.tensor(0.05))
         self.softplus = nn.Softplus()
@@ -134,11 +135,11 @@ class PhysicsRegularizedLoss(nn.Module):
 
     @property
     def beta(self) -> torch.Tensor:
-        return self.softplus(self.raw_beta)
+        return self.softplus(self.raw_beta) + 1e-3
 
     @property
     def gamma(self) -> torch.Tensor:
-        return self.softplus(self.raw_gamma)
+        return self.softplus(self.raw_gamma) + 1e-3
 
     def forward(self, preds: torch.Tensor, targets: torch.Tensor,
                 inputs: Optional[torch.Tensor] = None, ews: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -239,7 +240,11 @@ def cumulative_pce(pred_seq: torch.Tensor, beta: torch.Tensor, gamma: torch.Tens
         return 0.5 * (mse_S + mse_I)
     else:
         if pred_seq.shape[1] < 3:
-            return torch.tensor(0.0, device=device)
+            seq = pred_seq[:, :, 0] if pred_seq.dim() == 3 else pred_seq
+            if seq.shape[1] < 3:
+                return torch.tensor(1e-6, device=device)
+            sec = seq[:, 2:] - 2.0 * seq[:, 1:-1] + seq[:, :-2]
+            return torch.mean(sec ** 2) + 1e-6
         sec = pred_seq[:, 2:, :] - 2.0 * pred_seq[:, 1:-1, :] + pred_seq[:, :-2, :]
         return torch.mean(sec ** 2)
 

@@ -91,7 +91,8 @@ def localized_metrics_at_bifurcations(
     pre_window: Tuple[int, int] = (7, 14),
     ews_cols: Optional[List[str]] = None,
     physics_loss_module: Optional[object] = None,
-    device: str = 'cpu'
+    device: str = 'cpu',
+    x_scaler: Optional[Any] = None,
 ) -> Dict[str, float]:
     """
     Compute localized MSE and cumulative PCE around detected bifurcations for a single series.
@@ -168,8 +169,7 @@ def localized_metrics_at_bifurcations(
                             cur_ews = torch.tensor(cur_ews_np, dtype=torch.float32, device=device)
                     
                     if len(preds_step) > 0:
-                        raw_cat = torch.cat(preds_step, dim=0)
-                        pred_seq_tensor = raw_cat.unsqueeze(-1).permute(1, 0, 2) if raw_cat.ndim == 2 else raw_cat.permute(1, 0, 2)
+                        pred_seq_tensor = torch.cat([p.unsqueeze(1) for p in preds_step], dim=1)
                     else:
                         pred_seq_tensor = torch.empty((1, 0, x_t.shape[2]), device=device)
 
@@ -190,19 +190,50 @@ def localized_metrics_at_bifurcations(
             mse_list.append(mse_h)
 
             try:
+                # Prepare N and inverse-transform predictions if scaler provided
                 if x_t.shape[2] >= 3:
                     last_obs = x_t.cpu().numpy()[0, -1, 0:3]
                     N = float(np.sum(last_obs))
                 else:
                     N = 1.0
-                if physics_loss_module is not None and hasattr(physics_loss_module, 'beta') and hasattr(physics_loss_module, 'gamma'):
-                    beta_val = float(physics_loss_module.beta.detach().cpu().numpy())
-                    gamma_val = float(physics_loss_module.gamma.detach().cpu().numpy())
+
+                # Prefer the model's own physics loss when available; otherwise, use a passed-in module.
+                physics_module = physics_loss_module
+                if physics_module is None and hasattr(model, 'physics_loss'):
+                    physics_module = model.physics_loss
+                if physics_module is None and hasattr(model, 'beta') and hasattr(model, 'gamma'):
+                    physics_module = model
+
+                if physics_module is not None and hasattr(physics_module, 'beta') and hasattr(physics_module, 'gamma'):
+                    beta_val = float(physics_module.beta.detach().cpu().numpy())
+                    gamma_val = float(physics_module.gamma.detach().cpu().numpy())
                 else:
                     beta_val = 0.0
                     gamma_val = 0.0
-                pce_val = float(cumulative_pce(pred_seq_tensor.cpu(), beta_val, gamma_val, N).cpu().numpy())
-            except Exception:
+
+                # Inverse-transform pred_seq_tensor to original feature scale if x_scaler provided
+                pred_for_pce = pred_seq_tensor.cpu().numpy()
+                if x_scaler is not None:
+                    try:
+                        b, t, c = pred_for_pce.shape
+                        pred_reshaped = pred_for_pce.reshape(b * t, c)
+                        pred_inv = x_scaler.inverse_transform(pred_reshaped)
+                        pred_for_pce = pred_inv.reshape(b, t, c)
+                    except Exception:
+                        # fallback: keep raw preds
+                        pass
+
+                # Diagnostic logging: show prediction stats used for PCE
+                try:
+                    pf = np.asarray(pred_for_pce)
+                    logger.info("PCE diagnostic: pred_for_pce shape=%s, min=%s, max=%s, mean=%s, std=%s, last_obs_sample=%s, beta=%s, gamma=%s, N=%s",
+                                pf.shape, np.nanmin(pf), np.nanmax(pf), float(pf.mean()), float(pf.std()), (last_obs if 'last_obs' in locals() else 'N/A'), beta_val, gamma_val, N)
+                except Exception:
+                    logger.info("PCE diagnostic: could not compute full pred stats")
+                pce_val = float(cumulative_pce(torch.tensor(pred_for_pce), beta_val, gamma_val, N).cpu().numpy())
+                logger.info(f"Computed pce_val={pce_val:.6g} for window starting at {start}")
+            except Exception as e:
+                logger.exception(f"PCE computation failed: {e}")
                 pce_val = float('nan')
             pce_list.append(pce_val)
 
@@ -438,6 +469,7 @@ def run_lambda_sensitivity_analysis(
     horizon: int = 14,
     bifurcation_kwargs: Optional[Dict[str, Any]] = None,
     save_csv: bool = True,
+    x_scaler: Optional[Any] = None,
 ) -> pd.DataFrame:
     """
     Запуск серии экспериментов по значениям lambda.
@@ -458,12 +490,21 @@ def run_lambda_sensitivity_analysis(
             results.append({"lambda": lam, "mse_bifurcation": np.nan, "pce_bifurcation": np.nan})
             continue
 
+        # Build a physics-loss module for beta/gamma diagnostics during evaluation.
+        try:
+            from src.models.pr_patch import PhysicsRegularizedLoss
+            physics_loss_module = PhysicsRegularizedLoss(lambda_base=lam)
+        except Exception:
+            physics_loss_module = getattr(model, 'physics_loss', None)
+
         metrics = localized_metrics_at_bifurcations(
             df=data,
             unique_id=u_id,
             target_col=t_col,
             model=model,
             horizon=horizon,
+            physics_loss_module=physics_loss_module,
+            x_scaler=x_scaler,
             **bifurcation_kwargs,
         )
         
@@ -875,6 +916,17 @@ def plot_shap_summary(model, X_train, X_test, feature_names, save_path="artifact
             shap_values = shap_values[0]
 
     shap_values_arr = np.asarray(shap_values, dtype=np.float64)
+    try:
+        logger.info(
+            "SHAP values computed: shape=%s, min=%s, max=%s, mean_abs=%s, n_nan=%s",
+            getattr(shap_values_arr, 'shape', None),
+            np.nanmin(shap_values_arr),
+            np.nanmax(shap_values_arr),
+            np.nanmean(np.abs(shap_values_arr)),
+            int(np.isnan(shap_values_arr).sum())
+        )
+    except Exception:
+        logger.debug("Could not log SHAP stats")
     if shap_values_arr.ndim == 3 and shap_values_arr.shape[0] == 1:
         shap_values_arr = shap_values_arr[0]
 
