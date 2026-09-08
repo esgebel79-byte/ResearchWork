@@ -1,3 +1,23 @@
+Project: PR-Patch Explainability & Evaluation
+
+Usage
+- Place the real dataset at: `data/SPb.COVID-19.united.csv` (or in the repository root as `SPb.COVID-19.united.csv`).
+- Create and activate the venv, install dependencies from `requirements.txt`.
+
+Notes
+- The pipeline expects the CSV to contain the target column `OCCUPIED_BEDS_CALCULATED` (case-sensitive). If the file is not found, the pipeline falls back to a synthetic example for development.
+- On Windows, SHAP is installed from a prebuilt binary wheel (`shap==0.52.0`) to avoid requiring Microsoft Visual C++ Build Tools. Use the pinned `requirements.txt` to reproduce the working environment.
+
+Running
+```
+python -m venv venv
+venv\Scripts\Activate.ps1    # PowerShell
+venv\Scripts\python.exe -m pip install -r requirements.txt
+venv\Scripts\python.exe main.py
+```
+
+Outputs
+- Artifacts (plots and metrics) are written to `artifacts/plots/` and `artifacts/metrics/`.
 # Neural-Physical Hybrid Forecasting of Epidemic Bifurcations via Critical Slowing Down Detection (PR-Patch)
 
 Данный репозиторий содержит MLOps-платформу для гибридного нейрофизического прогнозирования временных рядов эпидемиологических данных (на примере COVID-19 в Санкт-Петербурге). В основе проекта лежит оригинальная архитектура **PR-Patch (Physics-Regularized PatchTST)**, интегрированная с методами обнаружения сигналов раннего предупреждения (Early Warning Signals, EWS) на основе концепции критического замедления (**Critical Slowing Down, CSD**) и механизмами объяснимого ИИ (**XAI**).

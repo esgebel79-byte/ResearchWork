@@ -144,22 +144,38 @@ if __name__ == "__main__":
     (project_root / "artifacts/metrics").mkdir(parents=True, exist_ok=True)
     (project_root / "artifacts/plots").mkdir(parents=True, exist_ok=True)
 
-    # 1. Загрузка данных и генерация признаков
-    logger.info("Шаг 1: Подготовка мультивариантного датасета и EWS-индикаторов...")
-    dates = pd.date_range(start="2025-01-01", periods=150, freq="D")
-    np.random.seed(42)
-    signal = np.sin(np.linspace(0, 10, 150)) * 100 + 200
-    signal[80:] += np.linspace(0, 300, 70) 
-    df_data = pd.DataFrame({
-        "ds": dates,
-        "unique_id": config.get("unique_id", "SPb"),
-        target_col: signal,
-        "PCR_TESTS": signal * 0.8 + np.random.normal(0, 10, 150),
-        "CONFIRMED.sk": signal * 0.5 + np.random.normal(0, 5, 150),
-        "ACTIVE.sk": signal * 0.3 + np.random.normal(0, 5, 150),
-        "var_ews": np.random.rand(150) * 0.1,
-        "ar1_ews": np.random.rand(150) * 0.9
-    })
+    # 1. Загрузка данных - предпочитаем реальный CSV `SPb.COVID-19.united.csv`.
+    logger.info("Шаг 1: Загрузка датасета SPb.COVID-19.united.csv (если присутствует)...")
+    csv_paths = [project_root / "SPb.COVID-19.united.csv", project_root / "data" / "SPb.COVID-19.united.csv"]
+    df_data = None
+    for p in csv_paths:
+        if p.exists():
+            logger.info(f"Загрузка данных из: {p}")
+            df_data = pd.read_csv(p)
+            break
+
+    if df_data is None:
+        logger.warning("Файл SPb.COVID-19.united.csv не найден; используем синтетический пример для разработки.")
+        dates = pd.date_range(start="2025-01-01", periods=150, freq="D")
+        np.random.seed(42)
+        signal = np.sin(np.linspace(0, 10, 150)) * 100 + 200
+        signal[80:] += np.linspace(0, 300, 70)
+        df_data = pd.DataFrame({
+            "ds": dates,
+            "unique_id": config.get("unique_id", "SPb"),
+            target_col: signal,
+            "PCR_TESTS": signal * 0.8 + np.random.normal(0, 10, 150),
+            "CONFIRMED.sk": signal * 0.5 + np.random.normal(0, 5, 150),
+            "ACTIVE.sk": signal * 0.3 + np.random.normal(0, 5, 150),
+            "var_ews": np.random.rand(150) * 0.1,
+            "ar1_ews": np.random.rand(150) * 0.9
+        })
+
+    # Log dataset shape and presence of target column
+    if target_col in df_data.columns:
+        logger.info(f"Loaded dataset shape: {df_data.shape}; target column '{target_col}' present.")
+    else:
+        logger.warning(f"Target column '{target_col}' not found in dataset; available columns: {list(df_data.columns)}")
 
     # 2. Анализируем чувствительность по Парето-компромиссу
     logger.info("Шаг 2: Запуск анализа чувствительности по сетке регуляризации lambda...")
@@ -187,44 +203,54 @@ if __name__ == "__main__":
 
     # Обертки для предсказаний
     X_background_flat = X_background.reshape(X_background.shape[0], -1)
-    
-    if shap is not None:
-        clustering = shap.utils.hclust(X_background_flat)
-        masker = shap.maskers.Partition(X_background_flat, clustering=clustering)
-        explainer = shap.PartitionExplainer(predict_fn_flat, masker=masker)
-        shap_values = explainer(X_instance.reshape(1, -1))
 
-        logger.info("Генерация карт важности SHAP (с деагрегацией патч -> лаг)...")
-        explain_shap_prpatch(
-            model_or_predict_fn=predict_fn_flat, 
-            X_background=X_background, 
-            X_instance=X_instance,
-            seq_len=seq_len,
-            patch_size=patch_size,
-            target_name=target_col,
-            nsamples=500,
-            device=device,
-            feature_names=feature_names
-        )
-    else:
-        logger.warning("SHAP is not installed. Skipping SHAP explainability. Install with: pip install -r requirements.txt")
-
-    if shap is not None:
+    # Clean old duplicates in artifacts/plots to avoid confusing duplicates
+    plots_dir = project_root / "artifacts" / "plots"
+    for p in plots_dir.glob("shap_*.png"):
         try:
-            logger.info("Генерация локальных весов LIME...")
-            explain_lime_instance(
-                predict_fn=predict_fn_flat,
-                X_train=X_background,
-                instance=X_instance[0],
-                target_name=target_col,
-                num_features=10,
-                feature_names=feature_names,
-                out_basename="lime"
-            )
-        except ImportError:
-            logger.warning("LIME is not installed. Skipping LIME explainability. Install with: pip install -r requirements.txt")
-    else:
+            p.unlink()
+        except Exception:
+            logger.debug(f"Could not remove old plot: {p}")
+    for p in plots_dir.glob("lime_*.png"):
+        try:
+            p.unlink()
+        except Exception:
+            logger.debug(f"Could not remove old plot: {p}")
+
+    # Single LIME + SHAP calls using the real trained model `best_model`.
+    # LIME
+    try:
+        logger.info("Генерация локальных весов LIME (best_model)...")
+        explain_lime_instance(
+            predict_fn=predict_fn_flat,
+            X_train=X_background,
+            instance=X_instance[0],
+            target_name=target_col,
+            num_features=10,
+            feature_names=feature_names,
+            out_basename="lime_occupied_beds_calculated"
+        )
+    except ImportError:
         logger.warning("LIME is not installed. Skipping LIME explainability. Install with: pip install -r requirements.txt")
+    except Exception as e:
+        logger.exception(f"LIME explain failed: {e}")
+
+    # SHAP summary using the production wrapper (plot_shap_summary) and best_model
+    try:
+        if shap is None:
+            logger.warning("SHAP is not installed. Skipping SHAP explainability. Install with: pip install -r requirements.txt")
+        else:
+            logger.info("Генерация SHAP summary (best_model)...")
+            plot_shap_summary(
+                model=best_model,
+                X_train=X_background,
+                X_test=X_instance,
+                feature_names=feature_names,
+                save_path=str(plots_dir / "shap_occupied_beds_calculated_summary.png"),
+                seq_len=seq_len
+            )
+    except Exception as e:
+        logger.exception(f"plot_shap_summary failed: {e}")
         
     # =====================================================================
     # 4. РАСШИРЕННЫЙ РАСЧЕТ И СРАВНЕНИЕ КОНФИГУРАЦИЙ МОДЕЛЕЙ (Table 2 & 3)
@@ -392,38 +418,5 @@ if __name__ == "__main__":
     feature_names = [f"{col}_lag_{lag}" for col in feature_cols for lag in range(seq_len)]
     if len(feature_names) != seq_len * len(feature_cols):
         raise ValueError(f"feature_names length mismatch: expected {seq_len * len(feature_cols)}, got {len(feature_names)}")
-
-    # --- 3. Вызов функции ---
-    # To ensure SHAP summary is computed with a stable, dense predictor (like in the smoke test),
-    # create a small ToyModel that maps flattened (seq_len * n_features) -> scalar and use it
-    class ToyModel(torch.nn.Module):
-        def __init__(self, seq_len, n_features):
-            super().__init__()
-            self.seq_len = seq_len
-            self.n_features = n_features
-            self.linear = torch.nn.Linear(seq_len * n_features, 1)
-        def forward(self, x):
-            b = x.shape[0]
-            y = x.reshape(b, -1)
-            return self.linear(y)
-
-    try:
-        n_features_actual = X_instance.shape[2]
-    except Exception:
-        n_features_actual = len(feature_cols)
-
-    toy_model = ToyModel(seq_len, n_features_actual).to(device)
-
-    plot_shap_summary(
-        model=toy_model,
-        X_train=X_background,
-        X_test=X_instance,
-        feature_names=feature_names,
-        save_path="artifacts/plots/shap_occupied_beds_calculated_summary_main.png",
-        seq_len=seq_len
-    )
-
-    logger.info("SHAP анализ завершен, график сохранен в artifacts/plots/")
-    
 
     logger.info("=== Пайплайн успешно завершен! Все артефакты сохранены в 'artifacts/' ===")

@@ -853,13 +853,6 @@ def plot_shap_summary(model, X_train, X_test, feature_names, save_path="artifact
         logger.warning("SHAP values are empty or all-NaN; skipping SHAP plot.")
         return
 
-    # Debug print before creating the figure to help diagnose empty SHAP outputs
-    try:
-        print(f"[DEBUG SHAP main.py] X_train shape: {np.asarray(X_train).shape}, SHAP values shape: {np.array(shap_values).shape}, Non-zero/Non-NaN count: {np.count_nonzero(~np.isnan(shap_values))}")
-    except Exception:
-        # best-effort debug print; don't fail the plotting on debug formatting issues
-        logger.debug("[DEBUG SHAP main.py] Could not print debug SHAP summary shapes.")
-
     # Fresh figure, draw, save with robust error handling
     plt.figure()
     try:
