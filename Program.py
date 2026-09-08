@@ -21,7 +21,6 @@ Notes:
 
 Dependencies: torch, numpy, pandas, shap, lime, matplotlib, sklearn
 
-Author: Copilot-style assistant (adapt and integrate into your notebook)
 """
 
 import warnings

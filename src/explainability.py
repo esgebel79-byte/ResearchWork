@@ -138,12 +138,15 @@ def explain_lime_instance(
     predict_fn: Callable[[np.ndarray], np.ndarray],
     X_train: np.ndarray,
     instance: np.ndarray,
+    n_patches: int = 8,
+    n_features = 4,
     feature_names: Optional[List[str]] = None,
     target_name: str = 'target',
     num_features: int = 10,
     save: bool = True,
     out_basename: Optional[str] = None
 ) -> Tuple[Any, Path]:
+    
     """Локальная LIME-интерпретация для временных рядов (flat features)."""
     X_tr = _ensure_numpy(X_train)
     inst = _ensure_numpy(instance)
@@ -154,11 +157,27 @@ def explain_lime_instance(
     explainer = lime_tabular.LimeTabularExplainer(Xtrain_flat, feature_names=feature_names, mode='regression')
     
     def predict_flat(x_flat: np.ndarray) -> np.ndarray:
-        seq_len = inst.shape[0] if inst.ndim == 2 else inst.shape[1]
-        n_features = int(x_flat.shape[1] / seq_len)
-        x3 = x_flat.reshape((-1, seq_len, n_features))
+        if x_flat.ndim == 1:
+            x_flat = x_flat.reshape(1, -1)
+
+        #_, n_patches, n_features = X_tr.shape
+        #x_temp = x_flat.reshape((-1, 8, 4))
+        #x3 = np.repeat(x_temp, 2, axis=2)[:, :, :7]
+        x3 = x_flat.reshape((-1, 8, 7, 4))
+
+        #x3 = x_flat.reshape((-1, n_patches, n_features))
+
+
+        #seq_len = inst.shape[0] if inst.ndim == 2 else inst.shape[1]
+        #n_features = int(x_flat.shape[1] / seq_len)
+
+        #x_flat = x_flat.reshape(1, -1) if x_flat.ndim == 1 else x_flat
+        #x3 = x_flat.reshape((-1, n_patches, n_features))
+
+        #x3 = x_flat.reshape((-1, n_patches, n_features))
         preds = predict_fn(x3)
         preds = _ensure_numpy(preds)
+
         if preds.ndim == 3:
             return preds.reshape(preds.shape[0], -1)[:, 0]
         elif preds.ndim == 2:
