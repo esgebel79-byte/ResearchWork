@@ -14,8 +14,17 @@ import time
 import numpy as np
 import pandas as pd
 import torch
-import shap
-from lime import lime_tabular
+
+try:
+    import shap
+except ImportError:  # pragma: no cover - optional dependency
+    shap = None
+
+try:
+    from lime import lime_tabular
+except ImportError:  # pragma: no cover - optional dependency
+    lime_tabular = None
+
 import matplotlib.pyplot as plt
 
 ARTIFACTS_DIR = Path('artifacts')
@@ -51,6 +60,9 @@ def explain_shap_prpatch(
     """
     Расчет SHAP-значений с деагрегацией патчей в лаги и оптимизацией фоновой выборки.
     """
+    if shap is None:
+        raise ImportError("SHAP is required for explain_shap_prpatch. Install the project dependencies with pip install -r requirements.txt.")
+
     Xb = _ensure_numpy(X_background)
     Xi = _ensure_numpy(X_instance)
 
@@ -148,9 +160,31 @@ def explain_lime_instance(
 ) -> Tuple[Any, Path]:
     
     """Локальная LIME-интерпретация для временных рядов (flat features)."""
+    if lime_tabular is None:
+        raise ImportError("LIME is required for explain_lime_instance. Install the project dependencies with pip install -r requirements.txt.")
+
     X_tr = _ensure_numpy(X_train)
     inst = _ensure_numpy(instance)
-    
+
+    if X_tr.ndim == 1:
+        X_tr = X_tr.reshape(1, -1)
+    if inst.ndim == 1:
+        inst = inst.reshape(1, -1)
+
+    # Восстанавливаем исходную форму из X_train: (n_samples, seq_len, n_features)
+    if X_tr.ndim == 3:
+        n_rows, seq_len, n_features = X_tr.shape
+    else:
+        seq_len, n_features = X_tr.shape[1], 1 if X_tr.ndim == 1 else 1
+        X_tr = X_tr.reshape((X_tr.shape[0], seq_len, n_features))
+
+    expected_flat = seq_len * n_features
+    if feature_names is not None and len(feature_names) != expected_flat:
+        raise ValueError(
+            f"feature_names length mismatch: expected {expected_flat} names for shape ({seq_len}, {n_features}), "
+            f"got {len(feature_names)}. Use one name per flattened feature, e.g. ['col_lag_0', ...]."
+        )
+
     Xtrain_flat = X_tr.reshape((X_tr.shape[0], -1))
     inst_flat = inst.reshape((1, -1))
 
@@ -160,21 +194,9 @@ def explain_lime_instance(
         if x_flat.ndim == 1:
             x_flat = x_flat.reshape(1, -1)
 
-        #_, n_patches, n_features = X_tr.shape
-        #x_temp = x_flat.reshape((-1, 8, 4))
-        #x3 = np.repeat(x_temp, 2, axis=2)[:, :, :7]
-        x3 = x_flat.reshape((-1, 8, 7, 4))
-
-        #x3 = x_flat.reshape((-1, n_patches, n_features))
-
-
-        #seq_len = inst.shape[0] if inst.ndim == 2 else inst.shape[1]
-        #n_features = int(x_flat.shape[1] / seq_len)
-
-        #x_flat = x_flat.reshape(1, -1) if x_flat.ndim == 1 else x_flat
-        #x3 = x_flat.reshape((-1, n_patches, n_features))
-
-        #x3 = x_flat.reshape((-1, n_patches, n_features))
+        # restore the original shape from X_train's feature layout
+        original_shape = (x_flat.shape[0], seq_len, n_features)
+        x3 = x_flat.reshape(original_shape)
         preds = predict_fn(x3)
         preds = _ensure_numpy(preds)
 

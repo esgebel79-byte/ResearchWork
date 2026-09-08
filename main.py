@@ -16,7 +16,11 @@ import pandas as pd
 import torch
 import matplotlib
 matplotlib.use('Agg')
-import shap
+
+try:
+    import shap
+except ImportError:  # pragma: no cover - optional dependency
+    shap = None
 
 # Гарантируем бесконфликтный поиск модулей внутри 'src' из корня проекта
 project_root = Path(__file__).resolve().parent
@@ -169,6 +173,7 @@ if __name__ == "__main__":
     
     feature_cols = ["OCCUPIED_BEDS_CALCULATED", "PCR_TESTS", "CONFIRMED.sk", "ACTIVE.sk"]
     X_raw = df_data[feature_cols].values
+    feature_names = [f"{col}_lag_{lag}" for col in feature_cols for lag in range(seq_len)]
     
     # Объявление переменной гарантировано происходит здесь:
     X_background = [X_raw[i : i + seq_len] for i in range(0, min(50, len(X_raw) - seq_len - horizon))]
@@ -177,46 +182,49 @@ if __name__ == "__main__":
     target_idx = max(0, min(bif_indices[0] - seq_len, len(X_raw) - seq_len))
     X_instance = X_raw[target_idx : target_idx + seq_len].reshape(1, seq_len, -1)
 
-    #X_background_flat = X_background.reshape(X_background.shape[0], -1)
-    #X_instance_flat = X_instance.reshape(1, -1)
-
     # Создаем экземпляр модели
     best_model = dummy_model_trainer(lam=0.05, config=config).to(device)
 
     # Обертки для предсказаний
     X_background_flat = X_background.reshape(X_background.shape[0], -1)
-    clustering = shap.utils.hclust(X_background_flat)
-    masker = shap.maskers.Partition(X_background_flat, clustering=clustering)
-    explainer = shap.PartitionExplainer(predict_fn_flat, masker=masker)
-    shap_values = explainer(X_instance.reshape(1, -1))
-
-    logger.info("Генерация карт важности SHAP (с деагрегацией патч -> лаг)...")
-    explain_shap_prpatch(
-        model_or_predict_fn=predict_fn_flat, 
-        X_background=X_background, 
-        X_instance=X_instance,  # Передаем оригинальный 3D массив
-        seq_len=seq_len,
-        patch_size=patch_size,
-        target_name=target_col,
-        nsamples=500,      
-        device=device,
-        feature_names=feature_cols
-    )
-
-    X_agg = X_background.reshape(X_background.shape[0], 8, 7, 4).mean(axis=2)
-    X_agg_flat = X_agg.reshape(X_agg.shape[0], -1)
-    X_instance_agg = X_instance.reshape(1, 8, 7, 4).mean(axis=2).reshape(1, -1)
     
-    logger.info("Генерация локальных весов LIME...")
-    explain_lime_instance(
-        predict_fn = predict_fn_flat,       
-        X_train = X_agg_flat,   
-        instance = X_instance_agg[0],    
-        target_name = target_col, 
-        num_features = 10, 
-        feature_names = [f"P{p}_F{f}" for p in range(8) for f in range(4)]
-    )
+    if shap is not None:
+        clustering = shap.utils.hclust(X_background_flat)
+        masker = shap.maskers.Partition(X_background_flat, clustering=clustering)
+        explainer = shap.PartitionExplainer(predict_fn_flat, masker=masker)
+        shap_values = explainer(X_instance.reshape(1, -1))
 
+        logger.info("Генерация карт важности SHAP (с деагрегацией патч -> лаг)...")
+        explain_shap_prpatch(
+            model_or_predict_fn=predict_fn_flat, 
+            X_background=X_background, 
+            X_instance=X_instance,
+            seq_len=seq_len,
+            patch_size=patch_size,
+            target_name=target_col,
+            nsamples=500,
+            device=device,
+            feature_names=feature_names
+        )
+    else:
+        logger.warning("SHAP is not installed. Skipping SHAP explainability. Install with: pip install -r requirements.txt")
+
+    if shap is not None:
+        try:
+            logger.info("Генерация локальных весов LIME...")
+            explain_lime_instance(
+                predict_fn=predict_fn_flat,
+                X_train=X_background,
+                instance=X_instance[0],
+                target_name=target_col,
+                num_features=10,
+                feature_names=feature_names,
+                out_basename="lime"
+            )
+        except ImportError:
+            logger.warning("LIME is not installed. Skipping LIME explainability. Install with: pip install -r requirements.txt")
+    else:
+        logger.warning("LIME is not installed. Skipping LIME explainability. Install with: pip install -r requirements.txt")
         
     # =====================================================================
     # 4. РАСШИРЕННЫЙ РАСЧЕТ И СРАВНЕНИЕ КОНФИГУРАЦИЙ МОДЕЛЕЙ (Table 2 & 3)
@@ -380,21 +388,19 @@ if __name__ == "__main__":
     # --- 1. Импорт функции ---
     from src.evaluation import plot_shap_summary
 
-# --- 2. Подготовка данных для SHAP ---
-# Предположим, у вас есть обученная модель 'model', 
-# обучающая выборка 'X_train' и тестовая 'X_test' (в формате numpy или тензоров)
-# Также нужен список названий ваших признаков
-    feature_names = ["Rolling_Var", "Rolling_AR1", "Beds_Lag1", "Beds_Lag7"] 
+    # --- 2. Подготовка данных для SHAP ---
+    feature_names = [f"{col}_lag_{lag}" for col in feature_cols for lag in range(seq_len)]
+    if len(feature_names) != seq_len * len(feature_cols):
+        raise ValueError(f"feature_names length mismatch: expected {seq_len * len(feature_cols)}, got {len(feature_names)}")
 
-# --- 3. Вызов функции ---
-# Убедитесь, что вы передаете модель и данные, на которых она обучалась/тестировалась
+    # --- 3. Вызов функции ---
     plot_shap_summary(
-        model=best_model, 
-        X_train=X_background,  # Ваша выборка для калибровки explainer'а
-        X_test=X_instance,    # Данные, которые вы хотите интерпретировать
-        feature_names=feature_cols,
+        model=best_model,
+        X_train=X_background,
+        X_test=X_instance,
+        feature_names=feature_names,
         save_path="artifacts/plots/shap_summary.png",
-        seq_len=56
+        seq_len=seq_len
     )
 
     logger.info("SHAP анализ завершен, график сохранен в artifacts/plots/")

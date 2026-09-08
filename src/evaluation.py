@@ -24,7 +24,10 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # Support for 3D projection
 from scipy.stats import gaussian_kde
 
-import shap
+try:
+    import shap
+except ImportError:  # pragma: no cover - optional dependency
+    shap = None
 
 # Safe import of physical metrics from project modules
 try:
@@ -703,53 +706,133 @@ def plot_figure_response_funnel(save_path: str = "artifacts/plots/figure_respons
     plt.close()
     print(f"[INFO] Диаграмма воронки решений сохранена в: {save_path}")
 
-def plot_shap_summary(model, X_train, X_test, feature_names, save_path="artifacts/plots/shap_summary.png", seq_len=10):
+def plot_shap_summary(model, X_train, X_test, feature_names, save_path="artifacts/plots/shap_summary.png", seq_len=10, target_idx: Optional[int] = 0):
     
-    # 1. Функция-обертка, адаптирующая данные для модели
+    if shap is None:
+        raise ImportError("SHAP is required for plot_shap_summary. Install the project dependencies with pip install -r requirements.txt.")
+
+    X_train_arr = np.asarray(X_train)
+    X_test_arr = np.asarray(X_test)
+
+    if X_train_arr.ndim == 1:
+        X_train_arr = X_train_arr.reshape(1, -1)
+    if X_test_arr.ndim == 1:
+        X_test_arr = X_test_arr.reshape(1, -1)
+
+    if X_train_arr.ndim == 3:
+        X_train_flat = X_train_arr.reshape(X_train_arr.shape[0], -1)
+    elif X_train_arr.ndim == 2:
+        X_train_flat = X_train_arr
+    else:
+        raise ValueError(f"Unsupported X_train shape: {X_train_arr.shape}. Expected 2D or 3D array.")
+
+    if X_test_arr.ndim == 3:
+        X_test_flat = X_test_arr.reshape(X_test_arr.shape[0], -1)
+    elif X_test_arr.ndim == 2:
+        X_test_flat = X_test_arr
+    else:
+        raise ValueError(f"Unsupported X_test shape: {X_test_arr.shape}. Expected 2D or 3D array.")
+
+    if X_train_flat.shape[1] % seq_len != 0:
+        raise ValueError(
+            f"Feature dimension mismatch: X_train has {X_train_flat.shape[1]} columns, "
+            f"but seq_len={seq_len}. The background data must be shaped as (n_samples, seq_len * n_features_per_step)."
+        )
+
+    n_features_per_step = X_train_flat.shape[1] // seq_len
+    total_features = seq_len * n_features_per_step
+    if len(feature_names) != total_features:
+        raise ValueError(
+            f"feature_names length mismatch: expected {total_features} names for shape ({seq_len}, {n_features_per_step}), "
+            f"but got {len(feature_names)}."
+        )
+
     def wrapper(x):
-        # Преобразуем входные данные SHAP в numpy массив
-        x_np = np.array(x)
-        n_samples = x_np.shape[0]
-        total_features = x_np.shape[1]
-        n_features_per_step = total_features // seq_len
+        x_np = np.asarray(x)
+        if x_np.ndim == 1:
+            x_np = x_np.reshape(1, -1)
 
-        if total_features % seq_len != 0:
-            raise ValueError(f"Ошибка размерности! Всего признаков: {total_features}, "
-                         f"Длина окна (seq_len): {seq_len}. "
-                         f"Они не делятся нацело. Проверьте данные X_train.")
+        if x_np.ndim == 2:
+            n_samples = x_np.shape[0]
+            total_features_local = x_np.shape[1]
+            if total_features_local % seq_len != 0:
+                raise ValueError(
+                    f"Cannot reshape SHAP input of size {total_features_local} into seq_len={seq_len}. "
+                    f"Expected total_features divisible by seq_len."
+                )
+            n_features_per_step_local = total_features_local // seq_len
+            x_3d = x_np.reshape(n_samples, seq_len, n_features_per_step_local)
+        elif x_np.ndim == 3:
+            x_3d = x_np
+            n_samples, seq_local, n_features_local = x_np.shape
+            if seq_local != seq_len:
+                raise ValueError(f"Unexpected seq_len in SHAP input: got {seq_local}, expected {seq_len}.")
+            n_features_per_step_local = n_features_local
+        else:
+            raise ValueError(f"Unsupported SHAP input shape: {x_np.shape}. Expected 2D or 3D array.")
 
-        # Reshape в 3D (batch, seq_len, features)
-        print(f"DEBUG: Input shape={x_np.shape}, Expected seq_len={seq_len}")
-        x_3d = x_np.reshape(n_samples, seq_len, n_features_per_step)
-        
-        # Перенос в тензор на то же устройство, где модель
-        device = next(model.parameters()).device
-        tensor_x = torch.tensor(x_3d, dtype=torch.float32).to(device)
-        
-        model.eval()
-        with torch.no_grad():
-            prediction = model(tensor_x)
-            # Если модель возвращает tuple, берем первый элемент
-            if isinstance(prediction, (tuple, list)):
-                prediction = prediction[0]
-                
-        return prediction.cpu().numpy()
+        if hasattr(model, "predict"):
+            with torch.no_grad():
+                preds = model.predict(x_3d)
+        else:
+            model.eval()
+            with torch.no_grad():
+                tensor_x = torch.as_tensor(x_3d, dtype=torch.float32, device=next(model.parameters()).device)
+                preds = model(tensor_x)
 
-    # 2. Инициализация Explainer'а
-    # Передаем X_train напрямую (как numpy array) - это исправляет ошибку с masker
-    explainer = shap.KernelExplainer(wrapper, X_train)
-    
-    # 3. Вычисление SHAP значений
-    # KernelExplainer может быть очень медленным, ограничиваем выборку
-    shap_values = explainer.shap_values(X_test[:20])
+        if hasattr(preds, "detach"):
+            preds = preds.detach().cpu().numpy()
+        preds = np.asarray(preds, dtype=np.float64)
 
-    # 4. Визуализация
+        if preds.ndim == 0:
+            return np.asarray([float(preds)], dtype=np.float64)
+
+        if preds.ndim == 3:
+            preds = preds.reshape(preds.shape[0], -1)
+
+        if preds.ndim == 2:
+            if preds.shape[0] != n_samples:
+                if preds.shape[1] == n_samples:
+                    preds = preds.T
+                else:
+                    preds = preds.reshape(n_samples, -1)
+
+            if preds.shape[1] == 1:
+                return preds[:, 0].astype(np.float64)
+
+            if target_idx is not None and preds.shape[1] > target_idx:
+                return preds[:, target_idx].astype(np.float64)
+
+            return preds.astype(np.float64)
+
+        if preds.ndim == 1:
+            if preds.shape[0] != n_samples:
+                preds = preds.reshape(n_samples, -1)
+                if preds.shape[1] == 1:
+                    return preds[:, 0].astype(np.float64)
+            return preds.astype(np.float64)
+
+        raise ValueError(f"Unsupported model output shape: {preds.shape}. Expected 1D or 2D array.")
+
+    explainer = shap.KernelExplainer(wrapper, X_train_flat)
+    shap_values = explainer.shap_values(X_test_flat[:20])
+
+    if isinstance(shap_values, list):
+        if target_idx is not None and len(shap_values) > target_idx:
+            shap_values = shap_values[target_idx]
+        else:
+            shap_values = shap_values[0]
+
+    shap_values_arr = np.asarray(shap_values, dtype=np.float64)
+    if shap_values_arr.ndim == 3 and shap_values_arr.shape[0] == 1:
+        shap_values_arr = shap_values_arr[0]
+
     plt.figure()
-    shap.summary_plot(shap_values, X_test[:20], feature_names=feature_names, show=False)
-    
-    # Сохранение
+    if shap_values_arr.ndim == 2:
+        shap.summary_plot(shap_values_arr, X_test_flat[:20], feature_names=feature_names, show=False)
+    else:
+        shap.summary_plot(shap_values, X_test_flat[:20], feature_names=feature_names, show=False)
+
     Path(save_path).parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(save_path, bbox_inches="tight", dpi=300)
     plt.close()
-    
-    print(f"[INFO] SHAP Summary Plot сохранен в: {save_path}")
