@@ -14,6 +14,7 @@ import time
 import numpy as np
 import pandas as pd
 import torch
+import logging
 
 try:
     import shap
@@ -30,6 +31,8 @@ import matplotlib.pyplot as plt
 ARTIFACTS_DIR = Path('artifacts')
 PLOTS_DIR = ARTIFACTS_DIR / 'plots'
 PLOTS_DIR.mkdir(parents=True, exist_ok=True)
+
+logger = logging.getLogger(__name__)
 
 
 def _ensure_numpy(x: Any) -> np.ndarray:
@@ -123,17 +126,28 @@ def explain_shap_prpatch(
             shap_arr = lags_arr
 
     # 4. Построение графиков
+    # Sanity checks: ensure shap_arr is usable
+    try:
+        sa = np.asarray(shap_arr, dtype=np.float64)
+    except Exception:
+        logger.warning(f"SHAP array could not be converted to ndarray for {target_name}; skipping plot.")
+        return shap_arr, explainer
+
+    if sa.size == 0 or np.isnan(sa).all():
+        logger.warning(f"SHAP array is empty or all-NaN for {target_name}; skipping plot.")
+        return shap_arr, explainer
+
     fig, ax = plt.subplots(figsize=(10, 4))
-    mean_abs = np.mean(np.abs(shap_arr), axis=0)
-    
+    mean_abs = np.mean(np.abs(sa), axis=0)
+
     # Пытаемся построить summary_plot, если передан feature_names и размерности совпадают
     try:
-        if feature_names and len(feature_names) == shap_arr.shape[1]:
-            shap.summary_plot(shap_arr, Xi_flat, feature_names=feature_names, show=False)
+        if feature_names and len(feature_names) == sa.shape[1]:
+            shap.summary_plot(sa, Xi_flat, feature_names=feature_names, show=False)
         else:
-            raise ValueError
-    except Exception:
-        # Надежный fallback из первой версии
+            raise ValueError("feature_names missing or length mismatch; using fallback bar plot")
+    except Exception as e:
+        logger.warning(f"SHAP summary_plot failed or not suitable: {e}; drawing fallback bar chart.")
         ax.bar(np.arange(min(seq_len, len(mean_abs))), mean_abs[:seq_len], color='royalblue', edgecolor='black')
         ax.set_title(f'SHAP mean |importance| — {target_name}')
         ax.set_xlabel('lag index (0 most recent -> seq_len-1 farthest)')
@@ -141,6 +155,7 @@ def explain_shap_prpatch(
 
     timestamp = int(time.time())
     fname_summary = f"{out_basename or 'shap'}_{target_name}_summary_{timestamp}.png"
+    Path(PLOTS_DIR).mkdir(parents=True, exist_ok=True)
     _savefig(fig, PLOTS_DIR / fname_summary)
 
     return shap_arr, explainer
@@ -188,8 +203,20 @@ def explain_lime_instance(
     Xtrain_flat = X_tr.reshape((X_tr.shape[0], -1))
     inst_flat = inst.reshape((1, -1))
 
-    explainer = lime_tabular.LimeTabularExplainer(Xtrain_flat, feature_names=feature_names, mode='regression')
-    
+    # --- make a copy for explainer, and protect against zero-variance features ---
+    Xtrain_for_expl = Xtrain_flat.astype(np.float64).copy()
+    inst_for_expl = inst_flat.astype(np.float64).copy()
+
+    # Add tiny jitter to constant columns to avoid singular regressions inside LIME
+    col_std = Xtrain_for_expl.std(axis=0)
+    const_cols = np.where(col_std == 0)[0]
+    if const_cols.size > 0:
+        jitter = 1e-8 * (np.random.RandomState(0).randn(*Xtrain_for_expl[:, const_cols].shape))
+        Xtrain_for_expl[:, const_cols] += jitter
+        inst_for_expl[0, const_cols] += jitter[0] if jitter.shape[0] > 0 else 0.0
+
+    explainer = lime_tabular.LimeTabularExplainer(Xtrain_for_expl, feature_names=feature_names, mode='regression')
+
     def predict_flat(x_flat: np.ndarray) -> np.ndarray:
         if x_flat.ndim == 1:
             x_flat = x_flat.reshape(1, -1)
@@ -200,20 +227,53 @@ def explain_lime_instance(
         preds = predict_fn(x3)
         preds = _ensure_numpy(preds)
 
+        # convert to numpy float64 and preserve (N, M) shape when possible
+        preds = np.asarray(preds)
         if preds.ndim == 3:
-            return preds.reshape(preds.shape[0], -1)[:, 0]
-        elif preds.ndim == 2:
-            return preds[:, 0]
-        return preds.ravel()
+            preds = preds.reshape(preds.shape[0], -1)
+        if preds.ndim == 1:
+            preds = preds.reshape(preds.shape[0], 1)
+        preds = preds.astype(np.float64)
 
-    exp = explainer.explain_instance(inst_flat.ravel(), predict_flat, num_features=num_features)
+        # Debug: log output shape and sample values
+        try:
+            logger.debug(f"LIME predict_flat: x_flat.shape={x_flat.shape}, preds.shape={preds.shape}, sample={preds.ravel()[:8]}")
+        except Exception:
+            pass
+
+        return preds
+
+    exp = explainer.explain_instance(inst_for_expl.ravel(), predict_flat, num_features=num_features)
+
+    # Sanity-check the explanation before plotting
+    try:
+        pairs = exp.as_list()
+    except Exception:
+        pairs = None
+
+    if not pairs:
+        logger.warning(f"LIME returned empty explanation for {target_name}; skipping LIME plot.")
+        return exp, None
+
+    # Validate weights are numeric and not NaN
+    weights = [w for (_f, w) in pairs]
+    try:
+        w_arr = np.asarray(weights, dtype=np.float64)
+    except Exception:
+        logger.warning(f"LIME explanation weights are non-numeric for {target_name}; skipping LIME plot.")
+        return exp, None
+
+    if np.isnan(w_arr).all():
+        logger.warning(f"LIME explanation weights are all NaN for {target_name}; skipping LIME plot.")
+        return exp, None
+
     fig = exp.as_pyplot_figure()
-    
     timestamp = int(time.time())
     fname = f"{out_basename or 'lime'}_{target_name}_{timestamp}_lime.png"
     out_plot = PLOTS_DIR / fname
-    
+
     if save:
+        Path(out_plot).parent.mkdir(parents=True, exist_ok=True)
         _savefig(fig, out_plot)
     return exp, out_plot
 

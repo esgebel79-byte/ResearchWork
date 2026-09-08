@@ -771,48 +771,63 @@ def plot_shap_summary(model, X_train, X_test, feature_names, save_path="artifact
         else:
             raise ValueError(f"Unsupported SHAP input shape: {x_np.shape}. Expected 2D or 3D array.")
 
-        if hasattr(model, "predict"):
-            with torch.no_grad():
+        # call model and get numeric numpy predictions; add debug logging
+        try:
+            if hasattr(model, "predict"):
                 preds = model.predict(x_3d)
-        else:
-            model.eval()
-            with torch.no_grad():
-                tensor_x = torch.as_tensor(x_3d, dtype=torch.float32, device=next(model.parameters()).device)
-                preds = model(tensor_x)
+            else:
+                model.eval()
+                with torch.no_grad():
+                    tensor_x = torch.as_tensor(x_3d, dtype=torch.float32, device=next(model.parameters()).device)
+                    preds = model(tensor_x)
+        except Exception as e:
+            logger.exception(f"Model prediction failed inside SHAP wrapper: {e}")
+            raise
 
+        # convert to numpy
         if hasattr(preds, "detach"):
             preds = preds.detach().cpu().numpy()
-        preds = np.asarray(preds, dtype=np.float64)
+        preds = np.asarray(preds)
 
-        if preds.ndim == 0:
-            return np.asarray([float(preds)], dtype=np.float64)
+        # Debug info: shapes and some sample values
+        logger.debug(f"SHAP wrapper: input x_3d shape={x_3d.shape}, model output type={type(preds)}, shape={getattr(preds, 'shape', None)}")
+        try:
+            logger.debug(f"SHAP wrapper: model output sample values: {np.asarray(preds).ravel()[:8]}")
+        except Exception:
+            pass
 
+        # Ensure numeric dtype
+        try:
+            preds = np.asarray(preds, dtype=np.float64)
+        except Exception as e:
+            logger.exception(f"Converting preds to float64 failed: {e}")
+            raise
+
+        # If preds is 3D (batch, horizon, channels) flatten to (batch, -1)
         if preds.ndim == 3:
             preds = preds.reshape(preds.shape[0], -1)
 
-        if preds.ndim == 2:
-            if preds.shape[0] != n_samples:
-                if preds.shape[1] == n_samples:
-                    preds = preds.T
-                else:
-                    preds = preds.reshape(n_samples, -1)
-
-            if preds.shape[1] == 1:
-                return preds[:, 0].astype(np.float64)
-
-            if target_idx is not None and preds.shape[1] > target_idx:
-                return preds[:, target_idx].astype(np.float64)
-
-            return preds.astype(np.float64)
-
+        # If preds is 1D (batch,), keep as is
         if preds.ndim == 1:
-            if preds.shape[0] != n_samples:
-                preds = preds.reshape(n_samples, -1)
-                if preds.shape[1] == 1:
-                    return preds[:, 0].astype(np.float64)
-            return preds.astype(np.float64)
+            if preds.shape[0] != x_3d.shape[0]:
+                # try to reshape sensibly
+                try:
+                    preds = preds.reshape(x_3d.shape[0], -1)
+                except Exception:
+                    logger.exception(f"Unexpected 1D preds length {preds.shape[0]} vs n_samples {x_3d.shape[0]}")
+                    raise
 
-        raise ValueError(f"Unsupported model output shape: {preds.shape}. Expected 1D or 2D array.")
+        # Now preds is 1D (N,) or 2D (N, M)
+        if preds.ndim == 2:
+            # choose single target if requested
+            if preds.shape[1] == 1:
+                return preds[:, 0]
+            if target_idx is not None and target_idx < preds.shape[1]:
+                return preds[:, target_idx]
+            # otherwise return full 2D array
+            return preds
+
+        return preds
 
     explainer = shap.KernelExplainer(wrapper, X_train_flat)
     shap_values = explainer.shap_values(X_test_flat[:20])
@@ -827,11 +842,35 @@ def plot_shap_summary(model, X_train, X_test, feature_names, save_path="artifact
     if shap_values_arr.ndim == 3 and shap_values_arr.shape[0] == 1:
         shap_values_arr = shap_values_arr[0]
 
+    # Sanity checks: ensure we have usable SHAP values
+    try:
+        sv = np.asarray(shap_values_arr)
+    except Exception:
+        logger.warning("SHAP values could not be converted to ndarray; skipping SHAP plot.")
+        return
+
+    if sv.size == 0 or np.isnan(sv).all():
+        logger.warning("SHAP values are empty or all-NaN; skipping SHAP plot.")
+        return
+
+    # Debug print before creating the figure to help diagnose empty SHAP outputs
+    try:
+        print(f"[DEBUG SHAP main.py] X_train shape: {np.asarray(X_train).shape}, SHAP values shape: {np.array(shap_values).shape}, Non-zero/Non-NaN count: {np.count_nonzero(~np.isnan(shap_values))}")
+    except Exception:
+        # best-effort debug print; don't fail the plotting on debug formatting issues
+        logger.debug("[DEBUG SHAP main.py] Could not print debug SHAP summary shapes.")
+
+    # Fresh figure, draw, save with robust error handling
     plt.figure()
-    if shap_values_arr.ndim == 2:
-        shap.summary_plot(shap_values_arr, X_test_flat[:20], feature_names=feature_names, show=False)
-    else:
-        shap.summary_plot(shap_values, X_test_flat[:20], feature_names=feature_names, show=False)
+    try:
+        if sv.ndim == 2:
+            shap.summary_plot(sv, X_test_flat[:20], feature_names=feature_names, show=False)
+        else:
+            shap.summary_plot(sv, X_test_flat[:20], feature_names=feature_names, show=False)
+    except Exception as e:
+        logger.exception(f"Failed to render SHAP summary_plot: {e}")
+        plt.close()
+        return
 
     Path(save_path).parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(save_path, bbox_inches="tight", dpi=300)

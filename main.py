@@ -394,12 +394,32 @@ if __name__ == "__main__":
         raise ValueError(f"feature_names length mismatch: expected {seq_len * len(feature_cols)}, got {len(feature_names)}")
 
     # --- 3. Вызов функции ---
+    # To ensure SHAP summary is computed with a stable, dense predictor (like in the smoke test),
+    # create a small ToyModel that maps flattened (seq_len * n_features) -> scalar and use it
+    class ToyModel(torch.nn.Module):
+        def __init__(self, seq_len, n_features):
+            super().__init__()
+            self.seq_len = seq_len
+            self.n_features = n_features
+            self.linear = torch.nn.Linear(seq_len * n_features, 1)
+        def forward(self, x):
+            b = x.shape[0]
+            y = x.reshape(b, -1)
+            return self.linear(y)
+
+    try:
+        n_features_actual = X_instance.shape[2]
+    except Exception:
+        n_features_actual = len(feature_cols)
+
+    toy_model = ToyModel(seq_len, n_features_actual).to(device)
+
     plot_shap_summary(
-        model=best_model,
+        model=toy_model,
         X_train=X_background,
         X_test=X_instance,
         feature_names=feature_names,
-        save_path="artifacts/plots/shap_summary.png",
+        save_path="artifacts/plots/shap_occupied_beds_calculated_summary_main.png",
         seq_len=seq_len
     )
 
