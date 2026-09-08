@@ -322,15 +322,32 @@ def plot_figure_4_potential_landscape(df: pd.DataFrame, target_col: str, breakpo
         x_grid = np.linspace(-3, 3, 500)
         
         try:
-            kde = gaussian_kde(sub_data_norm)
-            p_x = kde(x_grid)
+            # Try KDE; if covariance is singular, retry with tiny jitter, otherwise fallback to histogram
+            try:
+                kde = gaussian_kde(sub_data_norm)
+                p_x = kde(x_grid)
+            except Exception:
+                # Add tiny regularization noise and retry
+                sub_try = sub_data_norm + np.random.normal(0, 1e-6, size=sub_data_norm.shape)
+                kde = gaussian_kde(sub_try)
+                p_x = kde(x_grid)
+
             v_x = -np.log(p_x + 1e-5)
             v_x -= np.min(v_x)
-            
             ax.plot(x_grid, v_x, label=label, color=color, linewidth=2.5)
             ax.fill_between(x_grid, v_x, alpha=0.1, color=color)
         except Exception as e:
-            logger.error(f"KDE failed for period {label}: {e}")
+            logger.error(f"KDE failed for period {label}: {e}; drawing histogram fallback.")
+            # Fallback: draw normalized histogram as approximate potential
+            try:
+                counts, bins = np.histogram(sub_data_norm, bins=30, density=True)
+                bins_center = 0.5 * (bins[:-1] + bins[1:])
+                p_x = counts + 1e-8
+                v_x = -np.log(p_x)
+                v_x = (v_x - np.min(v_x)) / (np.max(v_x) - np.min(v_x) + 1e-9)
+                ax.plot(bins_center, v_x, label=label + " (hist)", color=color, linewidth=2.0, linestyle='--')
+            except Exception as e2:
+                logger.error(f"Histogram fallback also failed for period {label}: {e2}")
 
     ax.set_title("Figure 4: Potential Landscape Evolution and Basin of Attraction Shrinking", fontsize=13, fontweight='bold', pad=15)
     ax.set_xlabel("State Space Coordinate (Normalized Fluctuations $x$)", fontsize=11)
@@ -789,6 +806,12 @@ def plot_shap_summary(model, X_train, X_test, feature_names, save_path="artifact
             preds = preds.detach().cpu().numpy()
         preds = np.asarray(preds)
 
+        # Ensure predictions are finite and replace NaN/Inf with sensible defaults
+        try:
+            preds = np.nan_to_num(preds, nan=0.0, posinf=1e12, neginf=-1e12)
+        except Exception:
+            preds = np.where(np.isfinite(preds), preds, 0.0)
+
         # Debug info: shapes and some sample values
         logger.debug(f"SHAP wrapper: input x_3d shape={x_3d.shape}, model output type={type(preds)}, shape={getattr(preds, 'shape', None)}")
         try:
@@ -830,7 +853,20 @@ def plot_shap_summary(model, X_train, X_test, feature_names, save_path="artifact
         return preds
 
     explainer = shap.KernelExplainer(wrapper, X_train_flat)
-    shap_values = explainer.shap_values(X_test_flat[:20])
+    # Call shap_values with robust error handling; try cleaned inputs and reduced sample size on failure
+    try:
+        shap_values = explainer.shap_values(X_test_flat[:20])
+    except Exception as e:
+        logger.warning(f"KernelExplainer.shap_values failed: {e}; attempting cleaned fallback.")
+        try:
+            X_train_clean = np.nan_to_num(X_train_flat, nan=0.0, posinf=1e12, neginf=-1e12)
+            X_test_clean = np.nan_to_num(X_test_flat, nan=0.0, posinf=1e12, neginf=-1e12)
+            explainer2 = shap.KernelExplainer(wrapper, X_train_clean)
+            # try with smaller slice
+            shap_values = explainer2.shap_values(X_test_clean[:5])
+        except Exception as e2:
+            logger.exception(f"Fallback SHAP computation also failed: {e2}; aborting SHAP plot.")
+            return
 
     if isinstance(shap_values, list):
         if target_idx is not None and len(shap_values) > target_idx:

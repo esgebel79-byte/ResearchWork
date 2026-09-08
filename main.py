@@ -93,6 +93,10 @@ def dummy_model_trainer(lam: float, config: dict) -> torch.nn.Module:
             return torch.zeros((batch_size, horizon, channels), device=x.device)
     return EmulatedPatchModel()
 
+PRED_CLIP_MIN = None
+PRED_CLIP_MAX = None
+
+
 def predict_fn_flat(x_in):
     # Защита от 1D-массивов (LIME иногда передает их)
     if x_in.ndim == 1:
@@ -124,7 +128,24 @@ def predict_fn_flat(x_in):
         out = best_model(t_x)
         if isinstance(out, (tuple, list)):
             out = out[0]
-    return out.cpu().numpy()
+    preds = out.cpu().numpy()
+
+    # Replace NaN/Inf and clip to configured sensible bounds to avoid explainer failures
+    try:
+        preds = np.nan_to_num(preds, nan=0.0, posinf=1e12, neginf=-1e12)
+    except Exception:
+        preds = np.asarray(preds)
+        preds = np.where(np.isfinite(preds), preds, 0.0)
+
+    # If global clip bounds are set, apply them (useful to keep magnitudes comparable to target)
+    global PRED_CLIP_MIN, PRED_CLIP_MAX
+    try:
+        if PRED_CLIP_MIN is not None and PRED_CLIP_MAX is not None:
+            preds = np.clip(preds, PRED_CLIP_MIN, PRED_CLIP_MAX)
+    except Exception:
+        pass
+
+    return preds
 
 
 # =====================================================================
@@ -146,7 +167,10 @@ if __name__ == "__main__":
 
     # 1. Загрузка данных - предпочитаем реальный CSV `SPb.COVID-19.united.csv`.
     logger.info("Шаг 1: Загрузка датасета SPb.COVID-19.united.csv (если присутствует)...")
-    csv_paths = [project_root / "SPb.COVID-19.united.csv", project_root / "data" / "SPb.COVID-19.united.csv"]
+    csv_paths = [
+        project_root / "SPb.COVID-19.united.csv",
+        project_root / "data" / "SPb.COVID-19.united.csv",
+    ]
     df_data = None
     for p in csv_paths:
         if p.exists():
@@ -177,10 +201,125 @@ if __name__ == "__main__":
     else:
         logger.warning(f"Target column '{target_col}' not found in dataset; available columns: {list(df_data.columns)}")
 
+    # Ensure required columns exist for downstream functions
+    if 'unique_id' not in df_data.columns:
+        logger.warning("Column 'unique_id' missing in CSV — adding default unique_id from config.")
+        df_data['unique_id'] = config.get('unique_id', 'SPb')
+    if 'ds' not in df_data.columns:
+        logger.warning("Column 'ds' (date) missing in CSV — creating a simple date index.")
+        df_data['ds'] = pd.date_range(start="2020-01-01", periods=len(df_data), freq='D')
+
+    # Ensure target column has no NaNs (fill forward/backward); drop remaining NaNs
+    if target_col in df_data.columns:
+        df_data[target_col] = df_data[target_col].ffill().bfill()
+        if df_data[target_col].isna().any():
+            logger.warning("Target column contains NaNs after fill; dropping rows with NaN in target.")
+            df_data = df_data[~df_data[target_col].isna()].reset_index(drop=True)
+
+    # --- Data preprocessing: ensure daily grid, fill missing values, and scale features/target ---
+    # Parse possible date columns
+    if 'ds' not in df_data.columns:
+        if 'TIME.sk' in df_data.columns:
+            df_data['ds'] = pd.to_datetime(df_data['TIME.sk']).dt.floor('D')
+        elif 'DATE.spb' in df_data.columns:
+            df_data['ds'] = pd.to_datetime(df_data['DATE.spb']).dt.floor('D')
+        else:
+            # already warned earlier; create monotonically increasing dates
+            df_data['ds'] = pd.date_range(start='2020-01-01', periods=len(df_data), freq='D')
+
+    df_data = df_data.set_index(pd.DatetimeIndex(df_data['ds'])).sort_index()
+    # Reindex to full daily grid
+    full_idx = pd.date_range(df_data.index.min(), df_data.index.max(), freq='D')
+    df_data = df_data.reindex(full_idx)
+
+    # Define heuristics for cumulative vs flow columns
+    cumul_keywords = ['CONFIRM', 'DEATH', 'VACC', 'V1.CS']
+    cols = list(df_data.columns)
+    for c in cols:
+        if c == 'ds' or c == 'unique_id':
+            continue
+        # Try coerce to numeric where reasonable; non-numeric columns will become NaN and then filled
+        try:
+            df_data[c] = pd.to_numeric(df_data[c], errors='coerce')
+        except Exception:
+            pass
+        try:
+            if any(k in c.upper() for k in cumul_keywords):
+                # cumulative: forward/backward fill
+                df_data[c] = df_data[c].ffill().bfill()
+            else:
+                # flow-like: interpolate in time then fill remaining with 0
+                df_data[c] = df_data[c].interpolate(method='time', limit_direction='both').fillna(0)
+        except Exception:
+            df_data[c] = df_data[c].ffill().bfill().fillna(0)
+
+    # restore ds column from index; ensure no duplicate 'ds' column remains
+    if 'ds' in df_data.columns:
+        df_data = df_data.drop(columns=['ds'], errors=True)
+    df_data = df_data.reset_index().rename(columns={'index': 'ds'})
+
+    # Ensure unique_id
+    if 'unique_id' not in df_data.columns:
+        df_data['unique_id'] = config.get('unique_id', 'SPb_COVID')
+
+    # Scaling: fit scalers on first 70% of data (time-based split)
+    from sklearn.preprocessing import StandardScaler
+    # Preserve original copy for numeric detection
+    df_original = df_data.copy()
+    # Choose numeric feature columns only (exclude datetime/ids)
+    numeric_cols = df_original.select_dtypes(include=[np.number]).columns.tolist()
+    if target_col not in numeric_cols:
+        numeric_cols = [target_col] + [c for c in numeric_cols if c != target_col]
+    feature_cols = numeric_cols
+
+    # Build X_raw and y_raw (preserve original copies)
+    df_original = df_data.copy()
+    X_raw = df_original[[c for c in feature_cols if c != target_col]].values
+    y_raw = df_original[target_col].values.reshape(-1, 1)
+
+    n_rows = len(df_original)
+    train_end = max(2, int(n_rows * 0.7))
+
+    X_scaler = StandardScaler()
+    y_scaler = StandardScaler()
+    try:
+        X_scaler.fit(X_raw[:train_end])
+        y_scaler.fit(y_raw[:train_end])
+    except Exception:
+        # fallback: fit on all data
+        X_scaler.fit(X_raw)
+        y_scaler.fit(y_raw)
+
+    X_scaled = X_scaler.transform(X_raw)
+    y_scaled = y_scaler.transform(y_raw).ravel()
+
+    # Set prediction clipping bounds using original-scale target range
+    try:
+        tmin = float(np.nanmin(df_original[target_col].values))
+        tmax = float(np.nanmax(df_original[target_col].values))
+        span = max(1.0, tmax - tmin)
+        PRED_CLIP_MIN = tmin - 0.5 * span
+        PRED_CLIP_MAX = tmax + 0.5 * span
+        logger.info(f"Prediction clipping bounds set: [{PRED_CLIP_MIN:.2f}, {PRED_CLIP_MAX:.2f}]")
+    except Exception:
+        PRED_CLIP_MIN = None
+        PRED_CLIP_MAX = None
+
+    # Prepare a scaled dataframe copy for downstream model analysis
+    df_scaled = df_original.copy()
+    for i, c in enumerate([c for c in feature_cols if c != target_col]):
+        df_scaled[c] = X_scaled[:, i]
+    df_scaled[target_col] = y_scaled
+
     # 2. Анализируем чувствительность по Парето-компромиссу
     logger.info("Шаг 2: Запуск анализа чувствительности по сетке регуляризации lambda...")
     lambda_grid = config.get("physics", {}).get("lambda_grid", [0.0, 0.01, 0.05, 0.1, 0.5, 1.0])
-    df_sens = run_lambda_sensitivity_analysis(dummy_model_trainer, lambda_grid, df_data, config, horizon)
+    # Pass scaled dataframe to sensitivity analysis so models train on normalized data
+    try:
+        df_sens = run_lambda_sensitivity_analysis(dummy_model_trainer, lambda_grid, df_scaled, config, horizon)
+    except Exception as e:
+        logger.exception(f"Lambda sensitivity analysis failed on scaled data: {e}; retrying on raw data.")
+        df_sens = run_lambda_sensitivity_analysis(dummy_model_trainer, lambda_grid, df_data, config, horizon)
 
     # 3. Интерпретация локальных патчей
     logger.info("Шаг 3: Поиск точек излома тренда и запуск SHAP/LIME интерпретации...")
@@ -188,7 +327,8 @@ if __name__ == "__main__":
     logger.info(f"Критические временные индексы перелома тренда: {bif_indices}")
     
     feature_cols = ["OCCUPIED_BEDS_CALCULATED", "PCR_TESTS", "CONFIRMED.sk", "ACTIVE.sk"]
-    X_raw = df_data[feature_cols].values
+    # Use scaled features for model inputs / explainers (model was trained on scaled data)
+    X_raw = df_scaled[feature_cols].values
     feature_names = [f"{col}_lag_{lag}" for col in feature_cols for lag in range(seq_len)]
     
     # Объявление переменной гарантировано происходит здесь:

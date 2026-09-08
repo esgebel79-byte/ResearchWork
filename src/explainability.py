@@ -94,14 +94,38 @@ def explain_shap_prpatch(
                 preds = model_or_predict_fn(x_tensor)
         
         preds = _ensure_numpy(preds)
+
+        # Convert to 2D (batch, -1) or 1D as expected and ensure numeric stability
         if preds.ndim == 3:
-            return preds.reshape(preds.shape[0], -1)[:, 0]
+            outp = preds.reshape(preds.shape[0], -1)
         elif preds.ndim == 2:
-            return preds[:, 0]
-        return preds.ravel()
+            outp = preds
+        else:
+            outp = preds.ravel()
+
+        try:
+            outp = np.nan_to_num(outp, nan=0.0, posinf=1e12, neginf=-1e12)
+        except Exception:
+            outp = np.where(np.isfinite(outp), outp, 0.0)
+
+        # If outp is 2D and single-column, return 1D array for SHAP/LIME expectations
+        if isinstance(outp, np.ndarray) and outp.ndim == 2 and outp.shape[1] == 1:
+            return outp[:, 0]
+        return outp
 
     Xb_flat = Xb_sub.reshape((Xb_sub.shape[0], -1))
     Xi_flat = Xi.reshape((Xi.shape[0], -1))
+
+    # Quick sanity-check: ensure the model/predict_fn returns finite values on background samples
+    try:
+        chk = predict_fn_internal(Xb_flat[: min(50, Xb_flat.shape[0])])
+        chk_arr = np.asarray(chk, dtype=np.float64)
+        if not np.isfinite(chk_arr).all():
+            logger.warning(f"SHAP predict_fn produced non-finite outputs on background samples for {target_name}; skipping SHAP.")
+            return np.array([]), None
+    except Exception as e:
+        logger.warning(f"SHAP predict_fn check failed: {e}; skipping SHAP for {target_name}.")
+        return np.array([]), None
 
     explainer = shap.KernelExplainer(predict_fn_internal, Xb_flat, link="identity")
     shap_vals = explainer.shap_values(Xi_flat, nsamples=nsamples)
@@ -207,15 +231,30 @@ def explain_lime_instance(
     Xtrain_for_expl = Xtrain_flat.astype(np.float64).copy()
     inst_for_expl = inst_flat.astype(np.float64).copy()
 
-    # Add tiny jitter to constant columns to avoid singular regressions inside LIME
+    # Ensure no NaN/Inf remain in training/background data passed to LIME
+    try:
+        Xtrain_for_expl = np.nan_to_num(Xtrain_for_expl, nan=0.0, posinf=0.0, neginf=0.0)
+        inst_for_expl = np.nan_to_num(inst_for_expl, nan=0.0, posinf=0.0, neginf=0.0)
+    except Exception:
+        Xtrain_for_expl = np.where(np.isfinite(Xtrain_for_expl), Xtrain_for_expl, 0.0)
+        inst_for_expl = np.where(np.isfinite(inst_for_expl), inst_for_expl, 0.0)
+
+    # Add tiny jitter to near-constant columns to avoid singular regressions inside LIME
     col_std = Xtrain_for_expl.std(axis=0)
-    const_cols = np.where(col_std == 0)[0]
+    const_cols = np.where(np.isclose(col_std, 0.0))[0]
     if const_cols.size > 0:
         jitter = 1e-8 * (np.random.RandomState(0).randn(*Xtrain_for_expl[:, const_cols].shape))
         Xtrain_for_expl[:, const_cols] += jitter
         inst_for_expl[0, const_cols] += jitter[0] if jitter.shape[0] > 0 else 0.0
 
-    explainer = lime_tabular.LimeTabularExplainer(Xtrain_for_expl, feature_names=feature_names, mode='regression')
+    # Disable automatic discretization which can fail with zero-range features (truncnorm scale<=0)
+    explainer = lime_tabular.LimeTabularExplainer(
+        Xtrain_for_expl,
+        feature_names=feature_names,
+        mode='regression',
+        discretize_continuous=False,
+        random_state=0,
+    )
 
     def predict_flat(x_flat: np.ndarray) -> np.ndarray:
         if x_flat.ndim == 1:
@@ -234,6 +273,11 @@ def explain_lime_instance(
         if preds.ndim == 1:
             preds = preds.reshape(preds.shape[0], 1)
         preds = preds.astype(np.float64)
+
+        # Replace any NaN/Inf in predictions with finite numbers to avoid LIME failures
+        if not np.isfinite(preds).all():
+            logger.warning(f"LIME predict_flat returned non-finite values; replacing with zeros. shape={preds.shape}")
+            preds = np.nan_to_num(preds, nan=0.0, posinf=0.0, neginf=0.0)
 
         # Debug: log output shape and sample values
         try:
