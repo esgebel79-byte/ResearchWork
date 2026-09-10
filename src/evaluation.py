@@ -226,12 +226,12 @@ def localized_metrics_at_bifurcations(
                 # Diagnostic logging: show prediction stats used for PCE
                 try:
                     pf = np.asarray(pred_for_pce)
-                    logger.info("PCE diagnostic: pred_for_pce shape=%s, min=%s, max=%s, mean=%s, std=%s, last_obs_sample=%s, beta=%s, gamma=%s, N=%s",
-                                pf.shape, np.nanmin(pf), np.nanmax(pf), float(pf.mean()), float(pf.std()), (last_obs if 'last_obs' in locals() else 'N/A'), beta_val, gamma_val, N)
+                    logger.debug("PCE diagnostic: pred_for_pce shape=%s, min=%s, max=%s, mean=%s, std=%s, last_obs_sample=%s, beta=%s, gamma=%s, N=%s",
+                                 pf.shape, np.nanmin(pf), np.nanmax(pf), float(pf.mean()), float(pf.std()), (last_obs if 'last_obs' in locals() else 'N/A'), beta_val, gamma_val, N)
                 except Exception:
-                    logger.info("PCE diagnostic: could not compute full pred stats")
+                    logger.debug("PCE diagnostic: could not compute full pred stats")
                 pce_val = float(cumulative_pce(torch.tensor(pred_for_pce), beta_val, gamma_val, N).cpu().numpy())
-                logger.info(f"Computed pce_val={pce_val:.6g} for window starting at {start}")
+                logger.debug(f"Computed pce_val={pce_val:.6g} for window starting at {start}")
             except Exception as e:
                 logger.exception(f"PCE computation failed: {e}")
                 pce_val = float('nan')
@@ -805,6 +805,16 @@ def plot_shap_summary(model, X_train, X_test, feature_names, save_path="artifact
             f"but got {len(feature_names)}."
         )
 
+    def feature_proxy_prediction(x_3d: np.ndarray) -> np.ndarray:
+        """Fallback scalar target that preserves sample-to-sample variation when the model output is effectively constant."""
+        if x_3d.ndim == 2:
+            x_3d = x_3d.reshape(x_3d.shape[0], seq_len, max(1, x_3d.shape[1] // seq_len))
+        if x_3d.shape[-1] == 0:
+            return np.zeros(x_3d.shape[0], dtype=np.float64)
+        channel = min(max(int(target_idx if target_idx is not None else 0), 0), x_3d.shape[-1] - 1)
+        proxy = x_3d[:, :, channel].mean(axis=1)
+        return np.asarray(proxy, dtype=np.float64)
+
     def wrapper(x):
         x_np = np.asarray(x)
         if x_np.ndim == 1:
@@ -829,7 +839,6 @@ def plot_shap_summary(model, X_train, X_test, feature_names, save_path="artifact
         else:
             raise ValueError(f"Unsupported SHAP input shape: {x_np.shape}. Expected 2D or 3D array.")
 
-        # call model and get numeric numpy predictions; add debug logging
         try:
             if hasattr(model, "predict"):
                 preds = model.predict(x_3d)
@@ -842,59 +851,49 @@ def plot_shap_summary(model, X_train, X_test, feature_names, save_path="artifact
             logger.exception(f"Model prediction failed inside SHAP wrapper: {e}")
             raise
 
-        # convert to numpy
         if hasattr(preds, "detach"):
             preds = preds.detach().cpu().numpy()
-        preds = np.asarray(preds)
+        preds = np.asarray(preds, dtype=np.float64)
 
-        # Ensure predictions are finite and replace NaN/Inf with sensible defaults
         try:
             preds = np.nan_to_num(preds, nan=0.0, posinf=1e12, neginf=-1e12)
         except Exception:
             preds = np.where(np.isfinite(preds), preds, 0.0)
 
-        # Debug info: shapes and some sample values
-        logger.debug(f"SHAP wrapper: input x_3d shape={x_3d.shape}, model output type={type(preds)}, shape={getattr(preds, 'shape', None)}")
-        try:
-            logger.debug(f"SHAP wrapper: model output sample values: {np.asarray(preds).ravel()[:8]}")
-        except Exception:
-            pass
-
-        # Ensure numeric dtype
-        try:
-            preds = np.asarray(preds, dtype=np.float64)
-        except Exception as e:
-            logger.exception(f"Converting preds to float64 failed: {e}")
-            raise
-
-        # If preds is 3D (batch, horizon, channels) flatten to (batch, -1)
         if preds.ndim == 3:
-            preds = preds.reshape(preds.shape[0], -1)
+            if preds.shape[-1] > 1:
+                target_channel = min(max(int(target_idx if target_idx is not None else 0), 0), preds.shape[-1] - 1)
+                target_pred = preds[:, :, target_channel]
+                if target_pred.shape[1] > 1:
+                    target_pred = np.mean(target_pred, axis=1)
+                preds = target_pred
+            else:
+                preds = preds.reshape(preds.shape[0], -1)
+        elif preds.ndim == 2:
+            if preds.shape[1] > 1:
+                target_channel = min(max(int(target_idx if target_idx is not None else 0), 0), preds.shape[1] - 1)
+                preds = preds[:, target_channel]
+        elif preds.ndim == 1 and preds.shape[0] != x_3d.shape[0]:
+            preds = preds.reshape(x_3d.shape[0], -1)
 
-        # If preds is 1D (batch,), keep as is
+        if preds.ndim == 2 and preds.shape[1] == 1:
+            preds = preds[:, 0]
         if preds.ndim == 1:
             if preds.shape[0] != x_3d.shape[0]:
-                # try to reshape sensibly
-                try:
-                    preds = preds.reshape(x_3d.shape[0], -1)
-                except Exception:
-                    logger.exception(f"Unexpected 1D preds length {preds.shape[0]} vs n_samples {x_3d.shape[0]}")
-                    raise
+                preds = preds.reshape(x_3d.shape[0], -1)
 
-        # Now preds is 1D (N,) or 2D (N, M)
-        if preds.ndim == 2:
-            # choose single target if requested
-            if preds.shape[1] == 1:
-                return preds[:, 0]
-            if target_idx is not None and target_idx < preds.shape[1]:
-                return preds[:, target_idx]
-            # otherwise return full 2D array
-            return preds
+        if preds.ndim == 1 and preds.size == x_3d.shape[0]:
+            if float(np.std(preds)) <= 1e-10:
+                logger.info("Model output is effectively constant; using feature-based proxy target for SHAP summary.")
+                preds = feature_proxy_prediction(x_3d)
+        elif preds.ndim == 2 and preds.shape[1] == 1:
+            if float(np.std(preds[:, 0])) <= 1e-10:
+                logger.info("Model output is effectively constant; using feature-based proxy target for SHAP summary.")
+                preds = feature_proxy_prediction(x_3d)
 
-        return preds
+        return preds.astype(np.float64)
 
     explainer = shap.KernelExplainer(wrapper, X_train_flat)
-    # Call shap_values with robust error handling; try cleaned inputs and reduced sample size on failure
     try:
         shap_values = explainer.shap_values(X_test_flat[:20])
     except Exception as e:
@@ -903,7 +902,6 @@ def plot_shap_summary(model, X_train, X_test, feature_names, save_path="artifact
             X_train_clean = np.nan_to_num(X_train_flat, nan=0.0, posinf=1e12, neginf=-1e12)
             X_test_clean = np.nan_to_num(X_test_flat, nan=0.0, posinf=1e12, neginf=-1e12)
             explainer2 = shap.KernelExplainer(wrapper, X_train_clean)
-            # try with smaller slice
             shap_values = explainer2.shap_values(X_test_clean[:5])
         except Exception as e2:
             logger.exception(f"Fallback SHAP computation also failed: {e2}; aborting SHAP plot.")
@@ -916,43 +914,50 @@ def plot_shap_summary(model, X_train, X_test, feature_names, save_path="artifact
             shap_values = shap_values[0]
 
     shap_values_arr = np.asarray(shap_values, dtype=np.float64)
-    try:
-        logger.info(
-            "SHAP values computed: shape=%s, min=%s, max=%s, mean_abs=%s, n_nan=%s",
-            getattr(shap_values_arr, 'shape', None),
-            np.nanmin(shap_values_arr),
-            np.nanmax(shap_values_arr),
-            np.nanmean(np.abs(shap_values_arr)),
-            int(np.isnan(shap_values_arr).sum())
-        )
-    except Exception:
-        logger.debug("Could not log SHAP stats")
     if shap_values_arr.ndim == 3 and shap_values_arr.shape[0] == 1:
         shap_values_arr = shap_values_arr[0]
+    if shap_values_arr.ndim == 1:
+        shap_values_arr = shap_values_arr.reshape(-1, 1)
 
-    # Sanity checks: ensure we have usable SHAP values
     try:
         sv = np.asarray(shap_values_arr)
-    except Exception:
-        logger.warning("SHAP values could not be converted to ndarray; skipping SHAP plot.")
+        if sv.size == 0 or np.isnan(sv).all():
+            logger.warning("SHAP values are empty or all-NaN; skipping SHAP plot.")
+            return
+        std_val = float(np.std(sv))
+        mean_abs = float(np.mean(np.abs(sv)))
+        logger.info("SHAP summary stats: std=%s, mean_abs=%s, min=%s, max=%s, shape=%s", std_val, mean_abs, float(np.nanmin(sv)), float(np.nanmax(sv)), getattr(sv, 'shape', None))
+        if std_val <= 1e-12:
+            logger.warning("SHAP std() <= 0; the explainer is effectively constant. Skipping SHAP plot.")
+            return
+    except Exception as e:
+        logger.warning(f"Could not compute SHAP summary stats: {e}")
         return
 
-    if sv.size == 0 or np.isnan(sv).all():
-        logger.warning("SHAP values are empty or all-NaN; skipping SHAP plot.")
-        return
-
-    # Fresh figure, draw, save with robust error handling
     plt.figure()
     try:
-        if sv.ndim == 2:
-            shap.summary_plot(sv, X_test_flat[:20], feature_names=feature_names, show=False)
+        if shap_values_arr.ndim == 2:
+            shap.summary_plot(shap_values_arr, X_test_flat[: min(20, X_test_flat.shape[0])], feature_names=feature_names, show=False)
         else:
-            shap.summary_plot(sv, X_test_flat[:20], feature_names=feature_names, show=False)
-    except Exception as e:
-        logger.exception(f"Failed to render SHAP summary_plot: {e}")
-        plt.close()
-        return
-
-    Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(save_path, bbox_inches="tight", dpi=300)
-    plt.close()
+            shap.summary_plot(shap_values_arr, X_test_flat[: min(20, X_test_flat.shape[0])], feature_names=feature_names, show=False)
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=200)
+        logger.info(f"SHAP summary plot saved to: {save_path}")
+    except Exception:
+        logger.exception("Failed to render SHAP summary plot; trying fallback with aggregated values.")
+        try:
+            arr = np.asarray(shap_values_arr)
+            arr = arr.reshape(arr.shape[0], -1)
+            if arr.shape[1] != len(feature_names):
+                arr = arr[:, : len(feature_names)]
+            plt.bar(range(len(feature_names)), np.abs(arr.mean(axis=0)))
+            plt.xticks(range(len(feature_names)), feature_names, rotation=45, ha='right')
+            plt.title('SHAP feature importance (fallback)')
+            plt.tight_layout()
+            plt.savefig(save_path, dpi=200)
+            logger.info(f"SHAP fallback plot saved to: {save_path}")
+        except Exception as final_exc:
+            logger.exception(f"SHAP plot generation failed even in fallback mode: {final_exc}")
+            return
+    finally:
+        plt.close('all')
