@@ -1,12 +1,4 @@
-"""
-src/evaluation.py
-
-Evaluation utilities focused on critical transition / bifurcation-local metrics,
-lambda physical regularization sensitivity analysis (Pareto optimization), 
-and early warning signal (EWS) reliability metrics.
-
-Contains production tools for Table 2, Table 3, Figure 4, and Figure 5.
-"""
+"""Evaluation utilities for bifurcation metrics, physics-consistency checks, and scientific plots."""
 from __future__ import annotations
 
 import os
@@ -29,7 +21,6 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     shap = None
 
-# Safe import of physical metrics from project modules
 try:
     from src.features import rolling_variance, rolling_ar1
     from src.models.pr_patch import cumulative_pce
@@ -37,7 +28,6 @@ except ImportError:
     def cumulative_pce(pred_seq, beta, gamma, N):
         return torch.tensor(0.0)
 
-# Directory ecosystem setup
 ARTIFACTS = Path("artifacts")
 METRICS_DIR = ARTIFACTS / "metrics"
 PLOTS_DIR = ARTIFACTS / "plots"
@@ -47,37 +37,44 @@ PLOTS_DIR.mkdir(parents=True, exist_ok=True)
 logger = logging.getLogger(__name__)
 
 
+def _get_physics_params(model: Any) -> Tuple[float, float]:
+    """Return beta/gamma if exposed by the model or its physics loss."""
+    physics_module = getattr(model, 'physics_loss', None)
+    if physics_module is None and hasattr(model, 'beta') and hasattr(model, 'gamma'):
+        physics_module = model
+
+    if physics_module is not None and hasattr(physics_module, 'beta') and hasattr(physics_module, 'gamma'):
+        beta = physics_module.beta.detach().cpu().numpy()
+        gamma = physics_module.gamma.detach().cpu().numpy()
+        return float(beta), float(gamma)
+    return 0.0, 0.0
+
+
 # ==========================================================================
-# 1. МАТЕМАТИЧЕСКИЕ АЛГОРИТМЫ И ДЕТЕКЦИЯ БИФУРКАЦИЙ
+# 1. Mathematical algorithms and bifurcation detection
 # ==========================================================================
 
 def detect_bifurcations(series: pd.Series, win: int = 7, slope_change_threshold: float = 2.0) -> List[int]:
-    """
-    Detect candidate bifurcation dates in a single series.
-    Returns list of indices where a slope change exceeded threshold * std.
-    """
+    """Detect candidate bifurcation indices in a univariate series."""
     arr = series.values.astype(float)
     n = len(arr)
     if n < win * 3:
         return []
-    slopes = []
+
+    slopes: List[float] = []
     X = np.arange(win).reshape(-1, 1)
-    
     for i in range(n - win + 1):
-        y = arr[i : i + win]
+        y = arr[i:i + win]
         if np.all(np.isnan(y)):
             slopes.append(0.0)
             continue
-        lr = LinearRegression().fit(X, y)
-        slopes.append(float(lr.coef_[0]))
-        
-    slopes = np.array(slopes)
+        slopes.append(float(LinearRegression().fit(X, y).coef_[0]))
+
+    slopes = np.asarray(slopes, dtype=float)
     ds = np.diff(slopes)
-    thresh = slope_change_threshold * np.nanstd(ds) if np.nanstd(ds) > 0 else 1.0
-    idx = np.where(np.abs(ds) > thresh)[0]
-    
-    t_indices = (idx + 1) + (win - 1)
-    return t_indices.tolist()
+    threshold = slope_change_threshold * np.nanstd(ds) if np.nanstd(ds) > 0 else 1.0
+    indices = np.where(np.abs(ds) > threshold)[0]
+    return ((indices + 1) + (win - 1)).astype(int).tolist()
 
 
 def localized_metrics_at_bifurcations(
@@ -94,20 +91,18 @@ def localized_metrics_at_bifurcations(
     device: str = 'cpu',
     x_scaler: Optional[Any] = None,
 ) -> Dict[str, float]:
-    """
-    Compute localized MSE and cumulative PCE around detected bifurcations for a single series.
-    """
+    """Compute localized MSE and cumulative PCE near bifurcation windows."""
     df_loc = df[df['unique_id'] == unique_id].sort_values('ds').reset_index(drop=True)
     if df_loc.empty:
         return {'n_bifurcations': 0, 'mse_bifurcation': float('nan'), 'pce_bifurcation': float('nan')}
-        
+
     series = df_loc[target_col]
     idxs = detect_bifurcations(series, win=7)
-    if len(idxs) == 0:
+    if not idxs:
         return {'n_bifurcations': 0, 'mse_bifurcation': float('nan'), 'pce_bifurcation': float('nan')}
 
-    mse_list = []
-    pce_list = []
+    mse_list: List[float] = []
+    pce_list: List[float] = []
 
     if ews_cols is None:
         ews_cols = [c for c in df_loc.columns if c.startswith('var_') or c.startswith('ar1_')]
@@ -115,31 +110,24 @@ def localized_metrics_at_bifurcations(
     for t_idx in idxs:
         start_min = max(0, t_idx - pre_window[1])
         start_max = max(0, t_idx - pre_window[0])
-        
+
         for start in range(start_min, start_max + 1):
             end = start + seq_len
             if end >= len(df_loc):
                 continue
             window = df_loc.iloc[start:end]
-            
+
             cols = ["PCR_TESTS", "CONFIRMED.sk", "ACTIVE.sk", "OCCUPIED_BEDS_CALCULATED"]
             if target_col in cols:
                 cols.remove(target_col)
             cols = [target_col] + cols
             cols = cols[:4]
-            
-            X = window[cols].values.astype(float)
-            X = X.reshape(1, X.shape[0], X.shape[1])
-            
-            if len(ews_cols) > 0:
-                EWS = window[ews_cols].fillna(0).values.astype(float)
-                EWS = EWS.reshape(1, EWS.shape[0], EWS.shape[1])
-            else:
-                EWS = None
 
+            X = window[cols].values.astype(float).reshape(1, -1, len(cols))
+            EWS = window[ews_cols].fillna(0).values.astype(float).reshape(1, -1, len(ews_cols)) if ews_cols else None
             x_t = torch.tensor(X, dtype=torch.float32, device=device)
             ews_t = torch.tensor(EWS, dtype=torch.float32, device=device) if EWS is not None else None
-            
+
             model.to(device)
             model.eval()
 
@@ -148,41 +136,32 @@ def localized_metrics_at_bifurcations(
                 if out.ndim == 3 and out.shape[1] >= horizon:
                     pred_seq_tensor = out[:, :horizon, :]
                 else:
+                    pred_steps = []
                     cur_x = x_t.clone()
                     cur_ews = ews_t.clone() if ews_t is not None else None
-                    preds_step = []
-                    for h in range(horizon):
+                    for _ in range(horizon):
                         p = model(cur_x, cur_ews)
                         if p.ndim == 1:
                             p = p.unsqueeze(0)
-                        preds_step.append(p)
-                        
-                        p_np = p.cpu().numpy()
+                        pred_steps.append(p)
                         cur_x_np = cur_x.cpu().numpy()
+                        p_np = p.cpu().numpy()
                         cur_x_np = np.concatenate([cur_x_np[:, 1:, :], p_np.reshape(p_np.shape[0], 1, p_np.shape[1])], axis=1)
                         cur_x = torch.tensor(cur_x_np, dtype=torch.float32, device=device)
-                        
                         if cur_ews is not None:
                             ews_np = cur_ews.cpu().numpy()
                             last_ews = ews_np[:, -1:, :]
                             cur_ews_np = np.concatenate([ews_np[:, 1:, :], last_ews], axis=1)
                             cur_ews = torch.tensor(cur_ews_np, dtype=torch.float32, device=device)
-                    
-                    if len(preds_step) > 0:
-                        pred_seq_tensor = torch.cat([p.unsqueeze(1) for p in preds_step], dim=1)
-                    else:
-                        pred_seq_tensor = torch.empty((1, 0, x_t.shape[2]), device=device)
+                    pred_seq_tensor = torch.cat([p.unsqueeze(1) for p in pred_steps], dim=1)
 
             future_end = end + horizon
-            if future_end <= len(df_loc):
-                true_future = df_loc.iloc[end: future_end][cols].values.astype(float)
-            else:
-                true_future = None
+            true_future = df_loc.iloc[end:future_end][cols].values.astype(float) if future_end <= len(df_loc) else None
 
             try:
                 pred_np = pred_seq_tensor.cpu().numpy()[0]
                 if true_future is not None and true_future.shape[0] >= pred_np.shape[0]:
-                    mse_h = float(np.mean((pred_np[:, 0] - true_future[: pred_np.shape[0], 0]) ** 2))
+                    mse_h = float(np.mean((pred_np[:, 0] - true_future[:pred_np.shape[0], 0]) ** 2))
                 else:
                     mse_h = float(np.mean((pred_np[:, 0]) ** 2))
             except Exception:
@@ -190,68 +169,41 @@ def localized_metrics_at_bifurcations(
             mse_list.append(mse_h)
 
             try:
-                # Prepare N and inverse-transform predictions if scaler provided
-                if x_t.shape[2] >= 3:
-                    last_obs = x_t.cpu().numpy()[0, -1, 0:3]
-                    N = float(np.sum(last_obs))
-                else:
-                    N = 1.0
+                last_obs = x_t.cpu().numpy()[0, -1, 0:3]
+                N = float(np.sum(last_obs))
+                physics_module = physics_loss_module or getattr(model, 'physics_loss', None) or model if hasattr(model, 'beta') and hasattr(model, 'gamma') else None
+                beta_val, gamma_val = _get_physics_params(physics_module) if physics_module is not None else (0.0, 0.0)
 
-                # Prefer the model's own physics loss when available; otherwise, use a passed-in module.
-                physics_module = physics_loss_module
-                if physics_module is None and hasattr(model, 'physics_loss'):
-                    physics_module = model.physics_loss
-                if physics_module is None and hasattr(model, 'beta') and hasattr(model, 'gamma'):
-                    physics_module = model
-
-                if physics_module is not None and hasattr(physics_module, 'beta') and hasattr(physics_module, 'gamma'):
-                    beta_val = float(physics_module.beta.detach().cpu().numpy())
-                    gamma_val = float(physics_module.gamma.detach().cpu().numpy())
-                else:
-                    beta_val = 0.0
-                    gamma_val = 0.0
-
-                # Inverse-transform pred_seq_tensor to original feature scale if x_scaler provided
                 pred_for_pce = pred_seq_tensor.cpu().numpy()
                 if x_scaler is not None:
                     try:
                         b, t, c = pred_for_pce.shape
-                        pred_reshaped = pred_for_pce.reshape(b * t, c)
-                        pred_inv = x_scaler.inverse_transform(pred_reshaped)
-                        pred_for_pce = pred_inv.reshape(b, t, c)
+                        pred_inv = x_scaler.inverse_transform(pred_for_pce.reshape(b * t, c)).reshape(b, t, c)
+                        pred_for_pce = pred_inv
                     except Exception:
-                        # fallback: keep raw preds
                         pass
 
-                # Diagnostic logging: show prediction stats used for PCE
-                try:
-                    pf = np.asarray(pred_for_pce)
-                    logger.debug("PCE diagnostic: pred_for_pce shape=%s, min=%s, max=%s, mean=%s, std=%s, last_obs_sample=%s, beta=%s, gamma=%s, N=%s",
-                                 pf.shape, np.nanmin(pf), np.nanmax(pf), float(pf.mean()), float(pf.std()), (last_obs if 'last_obs' in locals() else 'N/A'), beta_val, gamma_val, N)
-                except Exception:
-                    logger.debug("PCE diagnostic: could not compute full pred stats")
                 pce_val = float(cumulative_pce(torch.tensor(pred_for_pce), beta_val, gamma_val, N).cpu().numpy())
-                logger.debug(f"Computed pce_val={pce_val:.6g} for window starting at {start}")
-            except Exception as e:
-                logger.exception(f"PCE computation failed: {e}")
+            except Exception:
+                logger.warning("PCE computation failed for a bifurcation window.")
                 pce_val = float('nan')
             pce_list.append(pce_val)
 
     return {
         'n_bifurcations': len(idxs),
-        'mse_bifurcation': float(np.nanmean(mse_list)) if len(mse_list) > 0 else float('nan'),
-        'pce_bifurcation': float(np.nanmean([v for v in pce_list if not np.isnan(v)])) if any([not np.isnan(v) for v in pce_list]) else float('nan')
+        'mse_bifurcation': float(np.nanmean(mse_list)) if mse_list else float('nan'),
+        'pce_bifurcation': float(np.nanmean(pce_list)) if pce_list else float('nan'),
     }
 
 
 # ==========================================================================
-# 2. ВЫЧИСЛЕНИЕ МЕТРИК ДЛЯ СТАТЕЙНЫХ ТАБЛИЦ (TABLE 2 & TABLE 3)
+# 2. Metrics for static tables (Table 2 & Table 3)
 # ==========================================================================
 
 def calculate_table_2_metrics(y_true: Iterable[float], y_pred: Iterable[float], pce_value: float, lead_time_days: Optional[float] = None) -> Dict[str, float]:
     """
-    Вычисление полного набора метрик для Table 2 (Сравнительный анализ моделей).
-    Включает точностные ошибки (MSE, RMSE, MAE, MAPE) и терапевтическое окно упреждения.
+    Compute the full set of metrics for Table 2 (Model Comparison).
+    Includes accuracy errors (MSE, RMSE, MAE, MAPE) and therapeutic lead time window.
     """
     y_true = np.asarray(y_true).flatten()
     y_pred = np.asarray(y_pred).flatten()
@@ -277,36 +229,53 @@ def calculate_table_2_metrics(y_true: Iterable[float], y_pred: Iterable[float], 
 
 def compute_table_3_ews_metrics(true_bifurcations: List[int], detected_signals: List[int], max_allowed_lead_time: int = 30) -> Dict[str, Any]:
     """
-    Вычисление проактивных метрик надежности EWS-детектора для Table 3.
-    Оценивает TPR, FPR, математическое ожидание (μ) и дисперсию (σ) времени упреждения (Lead Time).
+    Compute proactive reliability metrics of the EWS detector for Table 3.
+    Assesses TPR, FPR, mean (μ) and variance (σ) of lead time.
+
+    FPR is computed as FP / (FP + TN), i.e., the fraction of non-bifurcation periods
+    incorrectly flagged as a warning signal.
     """
-    tp, fp, fn = 0, 0, 0
+    tp, fp, fn, tn = 0, 0, 0, 0
     lead_times = []
     matched_true_points = set()
-    
-    for sig in sorted(detected_signals):
-        future_waves = [w for w in true_bifurcations if w >= sig]
+    true_set = set(int(v) for v in true_bifurcations)
+    detection_set = set(int(v) for v in detected_signals)
+
+    for sig in sorted(detection_set):
+        future_waves = [w for w in true_set if w >= sig]
         if future_waves:
             closest_wave = min(future_waves)
             current_lead_time = closest_wave - sig
-            
             if current_lead_time <= max_allowed_lead_time:
                 if closest_wave not in matched_true_points:
                     tp += 1
                     lead_times.append(current_lead_time)
                     matched_true_points.add(closest_wave)
+                else:
+                    fp += 1
             else:
                 fp += 1
         else:
             fp += 1
 
-    for wave in true_bifurcations:
+    for wave in sorted(true_set):
         if wave not in matched_true_points:
             fn += 1
 
+    if true_set:
+        max_idx = max(true_set)
+    else:
+        max_idx = max(max(detection_set, default=0), 0)
+
+    all_periods = set(range(max_idx + 1))
+    non_event_periods = all_periods - true_set
+    tn = sum(1 for idx in non_event_periods if idx not in detection_set)
+    if (fp + tn) > 0:
+        fpr = fp / (fp + tn)
+    else:
+        fpr = 0.0
+
     tpr = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    fpr = fp / (tp + fp + 10) if (tp + fp) > 0 else 0.0
-    
     mean_lead_time = np.mean(lead_times) if lead_times else 0.0
     std_lead_time = np.std(lead_times) if lead_times else 0.0
 
@@ -316,12 +285,13 @@ def compute_table_3_ews_metrics(true_bifurcations: List[int], detected_signals: 
         "Mean Lead Time (μ_LT, Days)": round(mean_lead_time, 1),
         "Lead Time Std Dev (σ_LT, Days)": round(std_lead_time, 1),
         "Total Detected Waves": tp,
-        "False Alarms": fp
+        "False Alarms": fp,
+        "True Negatives": tn,
     }
 
 
 # ==========================================================================
-# 3. НАУЧНАЯ ГРАФИКА ДЛЯ СТАТЬИ (FIGURE 4 & FIGURE 5)
+# 3. Scientific plots for the article (Figure 4 & Figure 5)
 # ==========================================================================
 
 def plot_figure_4_potential_landscape(df: pd.DataFrame, target_col: str, breakpoint_idx: int, window_size: int = 30, save_path: str = "artifacts/plots/figure_4_potential_landscape.png"):
@@ -440,7 +410,7 @@ def plot_figure_5_phase_space(df: pd.DataFrame, target_col: str, breakpoint_idx:
             ax.annotate('', xy=(x[i+1], dxdt[i+1]), xytext=(x[i], dxdt[i]),
                         arrowprops=dict(arrowstyle="->", color='black', lw=1.2, mutation_scale=12), zorder=4)
 
-    ax.legend(loc="upper left", frameon=True, shadow=True, fontsize=10)
+    ax.legend(loc="lower right", frameon=True, shadow=True, fontsize=10, borderaxespad=0.2)
     plt.tight_layout()
     plt.savefig(save_path, bbox_inches='tight')
     plt.close()
@@ -620,7 +590,7 @@ def plot_figure_2_ews_signals(df: pd.DataFrame, target_col: str, bifurcation_idx
     ax1.set_ylabel("Occupied Beds", fontsize=11, fontweight='bold')
     ax1.grid(True, linestyle=":", alpha=0.6)
     ax1.legend(loc="upper left")
-    ax1.set_title("CRITICAL SLOWING DOWN (CSD) EARLY WARNING SIGNALS IN DATA", fontsize=12, fontweight='bold', pad=15)
+    ax1.set_title("CRITICAL SLOWING DOWN (CSD) EARLY WARNING SIGNALS В ДАННЫХ", fontsize=12, fontweight='bold', pad=15)
 
     # 2. Средний график: Rolling Variance
     ax2.plot(df.index, var_signal, color="#ff7f0e", linewidth=2.2, label="Rolling Variance (Indicator of Flattening)")
@@ -961,3 +931,23 @@ def plot_shap_summary(model, X_train, X_test, feature_names, save_path="artifact
             return
     finally:
         plt.close('all')
+
+def detect_bifurcation_by_pce_ews(series: pd.Series, ews_signal: pd.Series, win: int = 7, pce_threshold: float = 0.05, ews_threshold: float = 0.0) -> List[int]:
+    """Detect bifurcation dates using a rolling PCE/EWS trigger.
+
+    A point is flagged if both the rolling PCE and EWS score exceed their thresholds.
+    This avoids relying on a single slope-change heuristic.
+    """
+    if len(series) < win:
+        return []
+    pce = pd.Series(np.nan, index=series.index, dtype=float)
+    for i in range(win, len(series) + 1):
+        seg = series.iloc[i - win:i]
+        if seg.empty or seg.std(ddof=0) == 0:
+            pce.iloc[i - 1] = 0.0
+            continue
+        trend = seg.diff().dropna()
+        pce.iloc[i - 1] = trend.abs().mean() if not trend.empty else 0.0
+    ews = ews_signal.fillna(0.0).astype(float)
+    scores = (pce.fillna(0.0) > pce_threshold) & (ews > ews_threshold)
+    return np.where(scores.to_numpy())[0].tolist()

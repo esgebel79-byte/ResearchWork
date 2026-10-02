@@ -39,23 +39,20 @@ def rolling_ar1(series: pd.Series, window: int) -> pd.Series:
     for i in range(n):
         start = max(0, i - window + 1)
         window_vals = arr[start:i + 1]
-        # need at least 2 points to estimate AR(1)
-        if len(window_vals) < 2 or np.all(np.isnan(window_vals)):
-            vals.append(np.nan)
-            continue
-        # create lagged pairs
         s = pd.Series(window_vals).dropna()
-        if len(s) < 2:
+        if len(s) < 3:
             vals.append(np.nan)
             continue
-        y = s.values[1:]
-        x = s.values[:-1]
-        # solve linear reg coef = (x^T x)^{-1} x^T y
-        try:
-            coef = np.dot(x, y) / (np.dot(x, x) + 1e-8)
-            vals.append(float(coef))
-        except Exception:
+        x = s.iloc[:-1].to_numpy(dtype=float)
+        y = s.iloc[1:].to_numpy(dtype=float)
+        x_centered = x - x.mean()
+        y_centered = y - y.mean()
+        denom = np.dot(x_centered, x_centered) + 1e-8
+        if denom <= 1e-12:
             vals.append(np.nan)
+            continue
+        coef = float(np.dot(x_centered, y_centered) / denom)
+        vals.append(coef)
     return pd.Series(vals, index=series.index)
 
 
@@ -70,7 +67,13 @@ def enrich_features(processed_csv: str | Path, window: int = 14, id_col: str = '
     p = Path(processed_csv)
     if not p.exists():
         raise FileNotFoundError(p)
-    df = pd.read_csv(p, parse_dates=[date_col])
+
+    raw_cols = pd.read_csv(p, nrows=0).columns.tolist()
+    read_kwargs = {}
+    if date_col in raw_cols:
+        read_kwargs['parse_dates'] = [date_col]
+    df = pd.read_csv(p, **read_kwargs)
+
     cfg_targets = None
     try:
         from src.config import load_config
@@ -83,7 +86,6 @@ def enrich_features(processed_csv: str | Path, window: int = 14, id_col: str = '
         if cfg_targets:
             target_cols = [t for t in cfg_targets if t in df.columns]
         else:
-            # fallback: use 'y' if present, otherwise numeric columns excluding id/date
             target_cols = ['y'] if 'y' in df.columns else [c for c in df.select_dtypes(include='number').columns if c not in (id_col, date_col)]
 
     out_frames = []

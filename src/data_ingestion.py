@@ -42,7 +42,20 @@ class DataIngestion:
 
     def __post_init__(self):
         data_cfg = self.cfg.get("data", {})
-        self.raw_path = Path(self.raw_path or data_cfg.get("raw_path"))
+        configured_raw = data_cfg.get("raw_path")
+        candidates = []
+        if configured_raw:
+            candidates.append(Path(configured_raw))
+
+        root = Path(__file__).resolve().parents[1]
+        candidates.extend([
+            root / "data" / "SPb.COVID-19.united.csv",
+            root / "SPb.COVID-19.united.csv",
+            root / "data" / "raw" / "cases.csv",
+            root / "data" / "raw" / "data.csv",
+        ])
+
+        self.raw_path = next((p for p in candidates if p.exists()), Path(configured_raw) if configured_raw else root / "data" / "SPb.COVID-19.united.csv")
         self.processed_dir = Path(data_cfg.get("processed_dir", "data/processed"))
         self.date_col = data_cfg.get("date_col", self.date_col)
         self.id_col = data_cfg.get("id_col", self.id_col)
@@ -56,7 +69,20 @@ class DataIngestion:
         if not self.raw_path.exists():
             _LOG.error("Raw data file not found: %s", str(self.raw_path))
             raise FileNotFoundError(f"Raw data file not found: {self.raw_path}")
-        df = pd.read_csv(self.raw_path, parse_dates=[self.date_col])
+
+        df = pd.read_csv(self.raw_path)
+        if self.id_col not in df.columns:
+            df[self.id_col] = 'SPb'
+
+        if self.date_col not in df.columns:
+            for candidate in ['DATE.spb', 'TIME.sk', 'ds']:
+                if candidate in df.columns:
+                    df[self.date_col] = df[candidate]
+                    break
+            else:
+                df[self.date_col] = pd.date_range('2020-01-01', periods=len(df), freq='D')
+
+        df[self.date_col] = pd.to_datetime(df[self.date_col])
         _LOG.info("Raw data loaded: %s rows", len(df))
         return df
 
@@ -71,43 +97,37 @@ class DataIngestion:
         Возвращает агрегированный DataFrame с MultiIndex (unique_id, ds).
         """
         df = df.copy()
-        # приводим к дате (без времени)
+        if self.id_col not in df.columns:
+            df[self.id_col] = 'SPb'
+        if self.date_col not in df.columns:
+            for candidate in ['DATE.spb', 'TIME.sk', 'ds']:
+                if candidate in df.columns:
+                    df[self.date_col] = df[candidate]
+                    break
         df[self.date_col] = pd.to_datetime(df[self.date_col]).dt.normalize()
 
-        # если пользователь предоставил agg_map, используем её, иначе формируем правило
         if agg_map is None:
             agg_map = {}
-            # try to get targets from config if present
             targets = self.cfg.get('data', {}).get('targets', None)
-            # determine value columns to consider
             val_cols = [c for c in df.columns if c not in (self.id_col, self.date_col)]
             if targets:
-                # ensure targets are present in df
                 val_cols = [c for c in targets if c in df.columns]
             for col in val_cols:
                 name = col.lower()
-                # flow-like (tests) -> sum
                 if 'test' in name or 'pcr' in name or 'tests' in name:
                     agg_map[col] = 'sum'
-                # cumulative cases/confirmed -> last
                 elif 'confirm' in name or name.startswith('cases') or 'confirmed' in name:
                     agg_map[col] = 'last'
-                # capacity-like (beds, occupied, active) -> mean
                 elif 'active' in name or 'occup' in name or 'bed' in name:
                     agg_map[col] = 'mean'
                 else:
-                    # default to last observed value
                     agg_map[col] = 'last'
 
-        # Aggregate original rows per id/day according to agg_map
-        # First group original df by id and date and compute aggregates
         agg_candidates = {k: v for k, v in agg_map.items() if k in df.columns}
         grouped = df.groupby([self.id_col, self.date_col]).agg(agg_candidates)
-        # grouped now has MultiIndex (id, date). Convert to DataFrame with index as date
         out_frames: List[pd.DataFrame] = []
         for uid, g in grouped.groupby(level=0):
             g = g.droplevel(0).sort_index()
-            # reindex full daily range
             full_idx = pd.date_range(g.index.min(), g.index.max(), freq='D')
             g = g.reindex(full_idx)
             g[self.id_col] = uid
@@ -115,8 +135,6 @@ class DataIngestion:
             out_frames.append(g)
 
         daily = pd.concat(out_frames, ignore_index=True)
-
-        # Handle missing values: for numeric columns ffill then interpolate
         num_cols = daily.select_dtypes(include='number').columns.tolist()
         if num_cols:
             daily[num_cols] = daily[num_cols].ffill().interpolate()

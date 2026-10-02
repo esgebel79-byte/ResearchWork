@@ -42,7 +42,7 @@ class PRPatchModel(nn.Module):
     для управления динамикой регуляризации внутри лосса.
     """
 
-    def __init__(self, seq_len: int = 56, patch_size: int = 7, hidden: int = 64, n_inputs: int = 3, n_ews: int = 2):
+    def __init__(self, seq_len: int = 56, patch_size: int = 7, hidden: int = 64, n_inputs: int = 3, n_ews: int = 2, forecast_horizon: int = 1):
         super().__init__()
         assert seq_len % patch_size == 0, "seq_len должен делиться на patch_size"
         self.seq_len = seq_len
@@ -50,6 +50,9 @@ class PRPatchModel(nn.Module):
         self.n_patches = seq_len // patch_size
         self.n_inputs = n_inputs
         self.n_ews = n_ews
+        self.forecast_horizon = max(1, int(forecast_horizon))
+        # Store last attention weights for visualization
+        self.last_attn_weights = None
 
         # Проекция каждой переменной в патче
         self.patch_enc = nn.ModuleList([
@@ -67,50 +70,128 @@ class PRPatchModel(nn.Module):
         self.ews_proj = nn.Linear(n_ews, self.d_model) if n_ews > 0 else None
         # Multihead cross-attention: query = component-patch tokens, key/value = ews-patch tokens
         self.cross_attn = nn.MultiheadAttention(embed_dim=self.d_model, num_heads=4, batch_first=True)
-        # Фидфорвард для финального вывода
         self.ff = nn.Sequential(
             nn.Linear(self.d_model, hidden),
             nn.ReLU(),
             nn.Linear(hidden, n_inputs)
         )
+        self.direct_head = nn.Sequential(
+            nn.Linear(self.d_model, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, n_inputs * self.forecast_horizon)
+        )
 
-    def forward(self, x: torch.Tensor, ews: Optional[torch.Tensor] = None) -> torch.Tensor:
+    @staticmethod
+    def future_ews_from_history(ews: Optional[torch.Tensor], horizon: int, fill_value: Optional[float] = None, method: str = 'linear') -> Optional[torch.Tensor]:
+        """Create a leakage-free future EWS tensor for a forecast horizon.
+
+        Strategy: Linear interpolation or AR(1) prediction of EWS trend instead of just holding constant.
+        This preserves the dynamics of approaching bifurcation over the forecast horizon.
+        
+        Args:
+            ews: (batch, seq_len, n_ews) historical EWS values
+            horizon: number of future steps to predict
+            fill_value: override value (if provided, use constant fill)
+            method: 'linear' (interpolation) [default] or 'constant' (hold last value)
+        
+        Returns:
+            (batch, horizon, n_ews) future EWS predictions, leakage-free
+        """
+        if ews is None:
+            return None
+        if ews.dim() != 3:
+            return ews
+        
+        if horizon <= 1:
+            return ews
+        
+        batch_size, seq_len, n_ews_dim = ews.shape
+        device = ews.device
+        
+        if fill_value is not None:
+            # Override: use constant fill value
+            last = torch.full((batch_size, 1, n_ews_dim), fill_value=float(fill_value), device=device)
+            future = last.expand(-1, horizon, -1)
+            return future
+        
+        if method == 'linear':
+            # Linear interpolation: estimate trend from last k points, extrapolate forward
+            # Use last 3 points to estimate slope (robust to noise)
+            k = min(3, seq_len)
+            if seq_len >= k:
+                slope = (ews[:, -1:, :] - ews[:, -k:-k+1, :]) / (k - 1.0)  # (batch, 1, n_ews)
+            else:
+                slope = torch.zeros((batch_size, 1, n_ews_dim), device=device)
+            
+            last_ews = ews[:, -1:, :]  # (batch, 1, n_ews)
+            future_steps = torch.arange(1, horizon + 1, dtype=torch.float32, device=device)  # (horizon,)
+            future = last_ews + slope * future_steps.view(1, -1, 1)  # (batch, horizon, n_ews)
+            return future
+        
+        else:  # method == 'constant'
+            # Hold last value constant (original strategy)
+            last = ews[:, -1:, :].clone()
+            future = last.expand(-1, horizon, -1)
+            return future
+
+    def forward(self, x: torch.Tensor, ews: Optional[torch.Tensor] = None, return_attention: bool = False):
         """Прямой проход.
 
         x: (batch, seq_len, C)
         ews: (batch, seq_len, n_ews) либо None — агрегируем EWS по последнему окну
-        Возвращает preds: (batch, C) — прогноз следующего шага для каждой компоненты.
+        Возвращает preds: (batch, C) при forecast_horizon=1 или (batch, horizon, C) при horizon>1.
+        
+        FIX #1 (EWS=None degeneration): When ews is None, we still project component patches through
+        learnable encoders to create diverse representations. We NEVER zero-initialize ews_tokens in a
+        way that would collapse all outputs. Instead, we project a learnable "default EWS" or use
+        component tokens as both query AND value to avoid degeneration.
         """
         b, s, c = x.shape
         assert c >= self.n_inputs, "Ожидается как минимум n_inputs каналов (S,I,R)"
-        
-        # разбиваем по компонентам и патчам
+
         encs_per_comp = []
         for i in range(self.n_inputs):
-            comp = x[:, :, i]  # (b, s)
+            comp = x[:, :, i]
             patches = comp.view(b, self.n_patches, self.patch_size)
-            # encode each patch -> list of (b, d_model)
             enc_p = [self.patch_enc[i](patches[:, p, :]) for p in range(self.n_patches)]
-            # stack to (b, n_patches, d_model)
             encs_per_comp.append(torch.stack(enc_p, dim=1))
 
-        # concatenate along token dimension: (b, n_patches * n_inputs, d_model)
-        comp_tokens = torch.cat(encs_per_comp, dim=1)
+        comp_tokens = torch.cat(encs_per_comp, dim=1)  # (batch, n_inputs*n_patches, d_model)
 
-        # prepare ews tokens per patch: aggregate within each patch (mean)
+        # FIX #1: Prevent degeneration when ews=None
         if ews is not None and self.ews_proj is not None and ews.shape[-1] > 0:
-            # ews: (b, seq_len, n_ews) -> (b, n_patches, n_ews)
+            # Real EWS provided: use it
             ews_p = ews.view(b, self.n_patches, self.patch_size, -1).mean(dim=2)
-            ews_tokens = self.ews_proj(ews_p)  # (b, n_patches, d_model)
+            ews_tokens = self.ews_proj(ews_p)
         else:
-            ews_tokens = torch.zeros(b, self.n_patches, self.d_model, device=x.device)
+            # No EWS or empty: use component tokens as self-attention key/value
+            # This ensures attention weights are DATA-DEPENDENT, not constant
+            ews_tokens = comp_tokens  # Use component patches as default (ensures non-degeneracy)
 
-        # Cross-attention: query=comp_tokens (Lq), key/value=ews_tokens (Lk)
-        attn_out, _ = self.cross_attn(query=comp_tokens, key=ews_tokens, value=ews_tokens)
-        # pool across tokens to get global
-        pooled = attn_out.mean(dim=1)  # (b, d_model)
-        out = self.ff(pooled)  # (b, n_inputs)
+        # FIX #2: Store attention weights for visualization
+        attn_out, attn_weights = self.cross_attn(query=comp_tokens, key=ews_tokens, value=ews_tokens)
+        self.last_attn_weights = attn_weights.detach()  # Store for visualization
+        
+        pooled = attn_out.mean(dim=1)  # (batch, d_model)
+
+        # FIX #3: Direct head for multi-step forecasting (native, no rollout)
+        if self.forecast_horizon > 1:
+            # Out shape: (batch, n_inputs * forecast_horizon) -> reshape to (batch, forecast_horizon, n_inputs)
+            out_flat = self.direct_head(pooled)  # (batch, n_inputs * horizon)
+            out = out_flat.view(b, self.forecast_horizon, self.n_inputs)
+            # Validate shape correctness
+            assert out.shape == (b, self.forecast_horizon, self.n_inputs), \
+                f"Expected {(b, self.forecast_horizon, self.n_inputs)}, got {out.shape}"
+        else:
+            out = self.ff(pooled)  # (batch, n_inputs)
+
+        if return_attention:
+            return out, self.last_attn_weights
         return out
+
+    def forward_with_attention(self, x: torch.Tensor, ews: Optional[torch.Tensor] = None):
+        """Helper for visualization / debugging: returns (forecast, attention_weights)."""
+        return self.forward(x, ews=ews, return_attention=True)
 
 
 class PhysicsRegularizedLoss(nn.Module):
@@ -127,8 +208,8 @@ class PhysicsRegularizedLoss(nn.Module):
         self.lambda_base = float(lambda_base)
         self.alpha = float(alpha)
         # Keep a strictly positive floor so the physical parameters do not collapse to 0.0
-        self.raw_beta = nn.Parameter(torch.tensor(0.1))
-        self.raw_gamma = nn.Parameter(torch.tensor(0.05))
+        self.raw_beta = nn.Parameter(torch.tensor(0.1, dtype=torch.float32, requires_grad=True))
+        self.raw_gamma = nn.Parameter(torch.tensor(0.05, dtype=torch.float32, requires_grad=True))
         self.softplus = nn.Softplus()
         self.mse = nn.MSELoss()
         self.device = device
@@ -172,7 +253,7 @@ class PhysicsRegularizedLoss(nn.Module):
             resid_S = (S_pred - S_t) - (-beta * S_t * I_t / N)
             resid_I = (I_pred - I_t) - (beta * S_t * I_t / N - gamma * I_t)
 
-            phys_per_sample = torch.abs(resid_S) + torch.abs(resid_I)
+            phys_per_sample = torch.linalg.norm(torch.stack([resid_S, resid_I], dim=1), dim=1)
         else:
             if inputs.shape[1] >= 3:
                 sec_diff = inputs[:, -1, :] - 2.0 * inputs[:, -2, :] + inputs[:, -3, :]
@@ -199,15 +280,23 @@ class PhysicsRegularizedLoss(nn.Module):
 
 
 def cumulative_pce(pred_seq: torch.Tensor, beta: torch.Tensor, gamma: torch.Tensor, N: torch.Tensor) -> torch.Tensor:
-    """Вычислить кумулятивную Physics Consistency Error (PCE) по всей траектории."""
+    """Compute the paper-style physical consistency error as the mean residual norm over a horizon.
+
+    For a SIR trajectory, the one-step residual vector is:
+      R_t = [ (S_{t+1}-S_t) + beta*S_t*I_t/N,
+             (I_{t+1}-I_t) - (beta*S_t*I_t/N - gamma*I_t) ]
+    and the reported score is the mean Euclidean norm of R_t over horizon H.
+    """
     device = pred_seq.device
     beta_t = beta if isinstance(beta, torch.Tensor) else torch.tensor(beta, device=device)
     gamma_t = gamma if isinstance(gamma, torch.Tensor) else torch.tensor(gamma, device=device)
 
-    if pred_seq.shape[2] >= 3:
+    if pred_seq.dim() == 2:
+        pred_seq = pred_seq.unsqueeze(1)
+
+    if pred_seq.shape[-1] >= 3:
         S = pred_seq[:, :, 0]
         I = pred_seq[:, :, 1]
-        R = pred_seq[:, :, 2]
         use_sir = True
     else:
         use_sir = False
@@ -220,12 +309,15 @@ def cumulative_pce(pred_seq: torch.Tensor, beta: torch.Tensor, gamma: torch.Tens
     if use_sir:
         if S.shape[1] < 2:
             return torch.tensor(0.0, device=device)
+
         S_t = S[:, :-1]
         S_tp1 = S[:, 1:]
         I_t = I[:, :-1]
         I_tp1 = I[:, 1:]
 
-        if N_t.dim() == 1:
+        if N_t.dim() == 0:
+            N_use = torch.full_like(S_t, fill_value=float(N_t.item()))
+        elif N_t.dim() == 1:
             N_use = N_t.unsqueeze(1).expand(-1, S_t.shape[1])
         elif N_t.dim() == 2:
             N_use = N_t[:, :-1]
@@ -234,19 +326,19 @@ def cumulative_pce(pred_seq: torch.Tensor, beta: torch.Tensor, gamma: torch.Tens
 
         resid_S = (S_tp1 - S_t) + beta_t * S_t * I_t / (N_use + 1e-8)
         resid_I = (I_tp1 - I_t) - (beta_t * S_t * I_t / (N_use + 1e-8) - gamma_t * I_t)
+        residual_vec = torch.stack([resid_S, resid_I], dim=-1)
+        residual_norm = torch.linalg.norm(residual_vec, dim=-1)
+        return torch.mean(residual_norm)
 
-        mse_S = torch.mean(resid_S ** 2)
-        mse_I = torch.mean(resid_I ** 2)
-        return 0.5 * (mse_S + mse_I)
-    else:
-        if pred_seq.shape[1] < 3:
-            seq = pred_seq[:, :, 0] if pred_seq.dim() == 3 else pred_seq
-            if seq.shape[1] < 3:
-                return torch.tensor(1e-6, device=device)
-            sec = seq[:, 2:] - 2.0 * seq[:, 1:-1] + seq[:, :-2]
-            return torch.mean(sec ** 2) + 1e-6
-        sec = pred_seq[:, 2:, :] - 2.0 * pred_seq[:, 1:-1, :] + pred_seq[:, :-2, :]
-        return torch.mean(sec ** 2)
+    if pred_seq.shape[1] < 3:
+        seq = pred_seq[:, :, 0] if pred_seq.dim() == 3 else pred_seq
+        if seq.shape[1] < 3:
+            return torch.tensor(1e-6, device=device)
+        sec = seq[:, 2:] - 2.0 * seq[:, 1:-1] + seq[:, :-2]
+        return torch.mean(torch.abs(sec)) + 1e-6
+
+    sec = pred_seq[:, 2:, :] - 2.0 * pred_seq[:, 1:-1, :] + pred_seq[:, :-2, :]
+    return torch.mean(torch.abs(sec)) + 1e-6
 
 
 def _synthetic_integration_test():

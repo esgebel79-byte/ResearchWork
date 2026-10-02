@@ -9,15 +9,50 @@ Notes
 - On Windows, SHAP is installed from a prebuilt binary wheel (`shap==0.52.0`) to avoid requiring Microsoft Visual C++ Build Tools. Use the pinned `requirements.txt` to reproduce the working environment.
 
 Running
-```
+
+**On Windows (PowerShell):**
+```powershell
 python -m venv venv
-venv\Scripts\Activate.ps1    # PowerShell
-venv\Scripts\python.exe -m pip install -r requirements.txt
-venv\Scripts\python.exe main.py
+venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+python main.py
 ```
+
+**On Linux/macOS:**
+```bash
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+python main.py
+```
+
+**Troubleshooting**
+- If you see `ModuleNotFoundError: No module named 'torch'`, ensure venv is **activated** in your terminal before running `python main.py`. The script requires Python 3.11+.
+- If dependencies fail to install, update pip: `pip install --upgrade pip` and retry.
+- For GPU support (CUDA), replace `torch==2.1.2` with `torch==2.1.2+cu118` in `requirements.txt` before installing.
 
 Outputs
 - Artifacts (plots and metrics) are written to `artifacts/plots/` and `artifacts/metrics/`.
+
+### Figure 5: phase-space interpretation and physical dynamics
+
+The phase-space portrait in `artifacts/plots/figure_5_phase_space.png` visualizes the epidemic trajectory in the plane `(x(t), dx/dt)`, where `x(t)` is the smoothed occupied-bed capacity and `dx/dt` is the daily growth rate.
+
+![Figure 5: Phase-space trajectory and bifurcation](artifacts/plots/figure_5_phase_space.png)
+
+The trajectory reveals two dynamical regimes:
+
+- Regime I (stable attractor): the system evolves near a relatively compact, low-growth attractor with small `dx/dt`. This corresponds to the pre-crisis state, when daily load remains near the historical equilibrium and the system has enough slack capacity.
+- Regime II (post-bifurcation regime): once the early-warning indicators (EWS) fire, the trajectory departs from the stable basin and rotates toward a new, higher-capacity attractor. This is the onset of accelerated growth in daily hospital occupancy.
+
+Physically, the real-data trajectory is trapezoidal in shape:
+
+1. Initial growth phase: after an EWS trigger, the system enters a sharp acceleration window where `dx/dt` increases rapidly as the occupancy signal climbs and the system enters a congestion onset regime.
+2. Saturation phase: the derivative begins to flatten as the hospitalization system approaches its effective daily throughput limit — a hard operational constraint of the health system, including ICU and inpatient turnover capacity.
+3. Peak-capacity approach: the trajectory tends toward a plateau around `x ≈ 10300`, which represents the effective upper bound of occupied beds under the actual service capacity and operational adaptation. In this new attractor, the rate of change asymptotically approaches zero: `dx/dt -> 0`.
+
+This interpretation is consistent with the epidemiological view of a system that is initially resilient, then exhibits critical slowing down and bifurcation, and finally settles around a new equilibrial operating point with saturated daily growth. The lower-right legend placement keeps the curve, EWS marker, and trajectory readable without obscuring the phase-space dynamics.
+
 # Neural-Physical Hybrid Forecasting of Epidemic Bifurcations via Critical Slowing Down Detection (PR-Patch)
 
 Данный репозиторий содержит MLOps-платформу для гибридного нейрофизического прогнозирования временных рядов эпидемиологических данных (на примере COVID-19 в Санкт-Петербурге). В основе проекта лежит оригинальная архитектура **PR-Patch (Physics-Regularized PatchTST)**, интегрированная с методами обнаружения сигналов раннего предупреждения (Early Warning Signals, EWS) на основе концепции критического замедления (**Critical Slowing Down, CSD**) и механизмами объяснимого ИИ (**XAI**).
